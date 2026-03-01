@@ -109,6 +109,11 @@ class StreamingTranscriber {
         use_gpu_ = true;
     }
 
+    void to_half() {
+        model_.to(axiom::DType::Float16);
+        use_fp16_ = true;
+    }
+
     // Process a chunk of raw audio samples.
     // Returns any new text produced by this chunk.
     std::string transcribe_chunk(const Tensor &samples);
@@ -156,6 +161,7 @@ class StreamingTranscriber {
     EncoderCache encoder_cache_;
     StreamingDecodeState decode_state_;
     bool use_gpu_ = false;
+    bool use_fp16_ = false;
     PartialResultCallback partial_callback_;
 };
 

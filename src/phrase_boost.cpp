@@ -71,7 +71,7 @@ std::vector<std::vector<int>> ctc_greedy_decode_boosted(const Tensor &log_probs,
                                                         const ContextTrie &trie,
                                                         float boost_score,
                                                         int blank_id) {
-    auto lp = log_probs.ascontiguousarray();
+    auto lp = log_probs.to_float().ascontiguousarray();
     auto shape = lp.shape();
     int batch_size = static_cast<int>(shape[0]);
     int seq_len = static_cast<int>(shape[1]);
@@ -120,7 +120,7 @@ std::vector<std::vector<TimestampedToken>>
 ctc_greedy_decode_with_timestamps_boosted(const Tensor &log_probs,
                                           const ContextTrie &trie,
                                           float boost_score, int blank_id) {
-    auto lp = log_probs.ascontiguousarray();
+    auto lp = log_probs.to_float().ascontiguousarray();
     auto shape = lp.shape();
     int batch_size = static_cast<int>(shape[0]);
     int seq_len = static_cast<int>(shape[1]);
@@ -191,7 +191,8 @@ std::vector<std::vector<int>> tdt_greedy_decode_boosted(
         size_t hs = prediction.config().pred_hidden;
         std::vector<LSTMState> states(num_layers);
         for (int l = 0; l < num_layers; ++l) {
-            states[l] = {Tensor::zeros({1, hs}), Tensor::zeros({1, hs})};
+            states[l] = {Tensor::zeros({1, hs}, encoder_out.dtype()),
+                         Tensor::zeros({1, hs}, encoder_out.dtype())};
         }
 
         auto token = Tensor({1}, DType::Int32);
@@ -210,8 +211,11 @@ std::vector<std::vector<int>> tdt_greedy_decode_boosted(
                 auto [label_lp, dur_lp] = joint.forward(enc_t, pred);
 
                 // Manual argmax with boost on label log-probs
-                auto label_1d =
-                    label_lp.squeeze(0).squeeze(0).cpu().ascontiguousarray();
+                auto label_1d = label_lp.squeeze(0)
+                                    .squeeze(0)
+                                    .cpu()
+                                    .to_float()
+                                    .ascontiguousarray();
                 const float *label_data = label_1d.typed_data<float>();
                 int vocab_size = static_cast<int>(label_1d.shape()[0]);
 
@@ -276,7 +280,8 @@ tdt_greedy_decode_with_timestamps_boosted(
         size_t hs = prediction.config().pred_hidden;
         std::vector<LSTMState> states(num_layers);
         for (int l = 0; l < num_layers; ++l) {
-            states[l] = {Tensor::zeros({1, hs}), Tensor::zeros({1, hs})};
+            states[l] = {Tensor::zeros({1, hs}, encoder_out.dtype()),
+                         Tensor::zeros({1, hs}, encoder_out.dtype())};
         }
 
         auto token = Tensor({1}, DType::Int32);
@@ -294,8 +299,11 @@ tdt_greedy_decode_with_timestamps_boosted(
 
                 auto [label_lp, dur_lp] = joint.forward(enc_t, pred);
 
-                auto label_1d =
-                    label_lp.squeeze(0).squeeze(0).cpu().ascontiguousarray();
+                auto label_1d = label_lp.squeeze(0)
+                                    .squeeze(0)
+                                    .cpu()
+                                    .to_float()
+                                    .ascontiguousarray();
                 const float *label_data = label_1d.typed_data<float>();
                 int vocab_size = static_cast<int>(label_1d.shape()[0]);
 

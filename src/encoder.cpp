@@ -259,7 +259,10 @@ Tensor FastConformerEncoder::forward(const Tensor &input,
     int d_model = static_cast<int>(x.shape()[2]);
     auto pos_emb = sinusoidal_position_embedding(seq_len, d_model);
 
-    // Match pos_emb device to input
+    // Match pos_emb dtype and device to input
+    if (x.dtype() != pos_emb.dtype()) {
+        pos_emb = pos_emb.astype(x.dtype());
+    }
     if (x.device() != pos_emb.device()) {
         pos_emb = pos_emb.to(x.device());
     }

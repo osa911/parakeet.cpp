@@ -29,6 +29,7 @@ static void print_usage(const char *prog) {
            "mode)\n"
         << "  --features PATH  Load pre-computed features from .npy file\n"
         << "  --gpu          Run on Metal GPU\n"
+        << "  --fp16         Use half-precision (fp16) inference\n"
         << "  --timestamps   Show word-level timestamps\n"
         << "  --streaming    Use streaming mode (eou/nemotron models)\n"
         << "  --latency N    Right context frames for nemotron (0/1/6/13)\n"
@@ -41,7 +42,7 @@ static int run_tdt_ctc_110m(const std::string &weights_path,
                             const std::string &audio_path,
                             const std::string &vocab_path,
                             const std::string &features_path, bool use_ctc,
-                            bool use_gpu, bool show_timestamps,
+                            bool use_gpu, bool use_fp16, bool show_timestamps,
                             const std::vector<std::string> &boost_phrases = {},
                             float boost_score = 5.0f) {
     using namespace parakeet;
@@ -54,6 +55,11 @@ static int run_tdt_ctc_110m(const std::string &weights_path,
     auto weights = axiom::io::safetensors::load(weights_path);
     model.load_state_dict(weights, "", false);
     std::cout << "Model loaded (" << weights.size() << " tensors)" << std::endl;
+
+    if (use_fp16) {
+        model.to(axiom::DType::Float16);
+        std::cout << "Model cast to fp16" << std::endl;
+    }
 
     if (use_gpu) {
         auto t = Clock::now();
@@ -92,6 +98,8 @@ static int run_tdt_ctc_110m(const std::string &weights_path,
                      .count()
               << " ms" << std::endl;
 
+    if (use_fp16)
+        features = features.half();
     if (use_gpu)
         features = features.gpu();
 
@@ -198,7 +206,7 @@ static int run_tdt_ctc_110m(const std::string &weights_path,
 static int run_tdt_600m(const std::string &weights_path,
                         const std::string &audio_path,
                         const std::string &vocab_path, bool use_gpu,
-                        bool show_timestamps,
+                        bool use_fp16, bool show_timestamps,
                         const std::vector<std::string> &boost_phrases = {},
                         float boost_score = 5.0f) {
     using namespace parakeet;
@@ -211,6 +219,11 @@ static int run_tdt_600m(const std::string &weights_path,
     auto weights = axiom::io::safetensors::load(weights_path);
     model.load_state_dict(weights, "", false);
     std::cout << "Model loaded (" << weights.size() << " tensors)" << std::endl;
+
+    if (use_fp16) {
+        model.to(axiom::DType::Float16);
+        std::cout << "Model cast to fp16" << std::endl;
+    }
 
     if (use_gpu) {
         model.to(axiom::Device::GPU);
@@ -226,6 +239,8 @@ static int run_tdt_600m(const std::string &weights_path,
     AudioConfig audio_cfg;
     audio_cfg.n_mels = cfg.encoder.mel_bins;
     auto features = preprocess_audio(audio.samples, audio_cfg);
+    if (use_fp16)
+        features = features.half();
     if (use_gpu)
         features = features.gpu();
 
@@ -296,7 +311,7 @@ static int run_tdt_600m(const std::string &weights_path,
 static int run_rnnt_600m(const std::string &weights_path,
                          const std::string &audio_path,
                          const std::string &vocab_path, bool use_gpu,
-                         bool show_timestamps) {
+                         bool use_fp16, bool show_timestamps) {
     using namespace parakeet;
     using Clock = std::chrono::high_resolution_clock;
 
@@ -307,6 +322,11 @@ static int run_rnnt_600m(const std::string &weights_path,
     auto weights = axiom::io::safetensors::load(weights_path);
     model.load_state_dict(weights, "", false);
     std::cout << "Model loaded (" << weights.size() << " tensors)" << std::endl;
+
+    if (use_fp16) {
+        model.to(axiom::DType::Float16);
+        std::cout << "Model cast to fp16" << std::endl;
+    }
 
     if (use_gpu) {
         model.to(axiom::Device::GPU);
@@ -320,6 +340,8 @@ static int run_rnnt_600m(const std::string &weights_path,
 
     auto audio = read_audio(audio_path);
     auto features = preprocess_audio(audio.samples);
+    if (use_fp16)
+        features = features.half();
     if (use_gpu)
         features = features.gpu();
 
@@ -379,13 +401,15 @@ static int run_rnnt_600m(const std::string &weights_path,
 static int run_eou_streaming(const std::string &weights_path,
                              const std::string &audio_path,
                              const std::string &vocab_path, bool use_gpu,
-                             bool show_timestamps) {
+                             bool use_fp16, bool show_timestamps) {
     using namespace parakeet;
     using Clock = std::chrono::high_resolution_clock;
 
     std::cout << "Loading model: eou-120m (streaming)" << std::endl;
     StreamingTranscriber transcriber(weights_path, vocab_path,
                                      make_eou_120m_config());
+    if (use_fp16)
+        transcriber.to_half();
     if (use_gpu)
         transcriber.to_gpu();
 
@@ -442,7 +466,8 @@ static int run_eou_streaming(const std::string &weights_path,
 static int run_nemotron_streaming(const std::string &weights_path,
                                   const std::string &audio_path,
                                   const std::string &vocab_path, bool use_gpu,
-                                  bool show_timestamps, int latency_frames) {
+                                  bool use_fp16, bool show_timestamps,
+                                  int latency_frames) {
     using namespace parakeet;
     using Clock = std::chrono::high_resolution_clock;
 
@@ -450,6 +475,8 @@ static int run_nemotron_streaming(const std::string &weights_path,
               << latency_frames << " frames)" << std::endl;
     NemotronTranscriber transcriber(weights_path, vocab_path,
                                     make_nemotron_600m_config(latency_frames));
+    if (use_fp16)
+        transcriber.to_half();
     if (use_gpu)
         transcriber.to_gpu();
 
@@ -495,7 +522,8 @@ static int run_nemotron_streaming(const std::string &weights_path,
 // ─── Sortformer Diarization mode ─────────────────────────────────────────────
 
 static int run_sortformer(const std::string &weights_path,
-                          const std::string &audio_path, bool use_gpu) {
+                          const std::string &audio_path, bool use_gpu,
+                          bool use_fp16) {
     using namespace parakeet;
     using Clock = std::chrono::high_resolution_clock;
 
@@ -506,6 +534,11 @@ static int run_sortformer(const std::string &weights_path,
     auto weights = axiom::io::safetensors::load(weights_path);
     model.load_state_dict(weights, "", false);
 
+    if (use_fp16) {
+        model.to(axiom::DType::Float16);
+        std::cout << "Model cast to fp16" << std::endl;
+    }
+
     if (use_gpu) {
         model.to(axiom::Device::GPU);
     }
@@ -515,6 +548,8 @@ static int run_sortformer(const std::string &weights_path,
     audio_cfg.n_mels = cfg.nest_encoder.mel_bins;
     audio_cfg.normalize = false; // sortformer uses normalize: NA
     auto features = preprocess_audio(audio.samples, audio_cfg);
+    if (use_fp16)
+        features = features.half();
     if (use_gpu)
         features = features.gpu();
 
@@ -543,7 +578,7 @@ static int run_diarized(const std::string &weights_path,
                         const std::string &audio_path,
                         const std::string &vocab_path,
                         const std::string &sortformer_weights_path,
-                        bool use_ctc, bool use_gpu) {
+                        bool use_ctc, bool use_gpu, bool use_fp16) {
     using namespace parakeet;
     using Clock = std::chrono::high_resolution_clock;
 
@@ -565,6 +600,11 @@ static int run_diarized(const std::string &weights_path,
               << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0)
                      .count()
               << " ms)" << std::endl;
+
+    if (use_fp16) {
+        dt.to_half();
+        std::cout << "Models cast to fp16" << std::endl;
+    }
 
     if (use_gpu) {
         t0 = Clock::now();
@@ -651,6 +691,7 @@ int main(int argc, char *argv[]) {
         std::string model_type = "tdt-ctc-110m";
         bool use_ctc = false;
         bool use_gpu = false;
+        bool use_fp16 = false;
         bool show_timestamps = false;
         bool streaming = false;
         int latency_frames = 0;
@@ -670,6 +711,8 @@ int main(int argc, char *argv[]) {
                 use_ctc = false;
             } else if (arg == "--gpu") {
                 use_gpu = true;
+            } else if (arg == "--fp16") {
+                use_fp16 = true;
             } else if (arg == "--timestamps") {
                 show_timestamps = true;
             } else if (arg == "--streaming") {
@@ -701,25 +744,27 @@ int main(int argc, char *argv[]) {
         if (model_type == "tdt-ctc-110m") {
             return run_tdt_ctc_110m(
                 weights_path, audio_path, vocab_path, features_path, use_ctc,
-                use_gpu, show_timestamps, boost_phrases, boost_score);
+                use_gpu, use_fp16, show_timestamps, boost_phrases, boost_score);
         } else if (model_type == "tdt-600m") {
             return run_tdt_600m(weights_path, audio_path, vocab_path, use_gpu,
-                                show_timestamps, boost_phrases, boost_score);
+                                use_fp16, show_timestamps, boost_phrases,
+                                boost_score);
         } else if (model_type == "rnnt-600m") {
             return run_rnnt_600m(weights_path, audio_path, vocab_path, use_gpu,
-                                 show_timestamps);
+                                 use_fp16, show_timestamps);
         } else if (model_type == "eou-120m") {
             return run_eou_streaming(weights_path, audio_path, vocab_path,
-                                     use_gpu, show_timestamps);
+                                     use_gpu, use_fp16, show_timestamps);
         } else if (model_type == "nemotron-600m") {
             return run_nemotron_streaming(weights_path, audio_path, vocab_path,
-                                          use_gpu, show_timestamps,
+                                          use_gpu, use_fp16, show_timestamps,
                                           latency_frames);
         } else if (model_type == "sortformer") {
-            return run_sortformer(weights_path, audio_path, use_gpu);
+            return run_sortformer(weights_path, audio_path, use_gpu, use_fp16);
         } else if (model_type == "diarized") {
             return run_diarized(weights_path, audio_path, vocab_path,
-                                sortformer_weights_path, use_ctc, use_gpu);
+                                sortformer_weights_path, use_ctc, use_gpu,
+                                use_fp16);
         } else {
             std::cerr << "Unknown model type: " << model_type << std::endl;
             print_usage(argv[0]);
