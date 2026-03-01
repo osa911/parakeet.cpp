@@ -72,7 +72,8 @@ std::vector<std::vector<int>> rnnt_greedy_decode(ParakeetRNNT &model,
         size_t hs = model.prediction().config().pred_hidden;
         std::vector<LSTMState> states(num_layers);
         for (int l = 0; l < num_layers; ++l) {
-            states[l] = {Tensor::zeros({1, hs}), Tensor::zeros({1, hs})};
+            states[l] = {Tensor::zeros({1, hs}, encoder_out.dtype()),
+                         Tensor::zeros({1, hs}, encoder_out.dtype())};
         }
 
         // Start with blank token (SOS)
@@ -129,7 +130,8 @@ rnnt_greedy_decode_with_timestamps(ParakeetRNNT &model,
         size_t hs = model.prediction().config().pred_hidden;
         std::vector<LSTMState> states(num_layers);
         for (int l = 0; l < num_layers; ++l) {
-            states[l] = {Tensor::zeros({1, hs}), Tensor::zeros({1, hs})};
+            states[l] = {Tensor::zeros({1, hs}, encoder_out.dtype()),
+                         Tensor::zeros({1, hs}, encoder_out.dtype())};
         }
 
         auto token = Tensor({1}, DType::Int32);
@@ -147,8 +149,11 @@ rnnt_greedy_decode_with_timestamps(ParakeetRNNT &model,
                 auto logits = model.joint().forward(enc_t, pred);
 
                 // Manual argmax to get both index and log-prob
-                auto lp_1d =
-                    logits.squeeze(0).squeeze(0).cpu().ascontiguousarray();
+                auto lp_1d = logits.squeeze(0)
+                                 .squeeze(0)
+                                 .cpu()
+                                 .to_float()
+                                 .ascontiguousarray();
                 const float *lp_data = lp_1d.typed_data<float>();
                 int vocab_size = static_cast<int>(lp_1d.shape()[0]);
                 int token_id = 0;
