@@ -273,6 +273,59 @@ parakeet_diarized_result_t parakeet_diarized_transcriber_transcribe_pcm(
     parakeet_diarized_transcriber_t t, const float *samples, size_t n,
     parakeet_decoder_t decoder);
 
+/* ── VAD ─────────────────────────────────────────────────────────────────── */
+
+typedef struct parakeet_vad_s *parakeet_vad_t;
+
+typedef struct {
+    float threshold;
+    float neg_threshold;
+    int min_speech_duration_ms;
+    int min_silence_duration_ms;
+    int speech_pad_ms;
+    float max_speech_duration_s;
+} parakeet_vad_config_t;
+
+typedef struct {
+    int64_t start_sample;
+    int64_t end_sample;
+} parakeet_speech_segment_t;
+
+/** Get default VAD config values. */
+parakeet_vad_config_t parakeet_vad_config_default(void);
+
+/** Create a standalone Silero VAD instance. */
+parakeet_vad_t parakeet_vad_create(const char *weights_path);
+void           parakeet_vad_destroy(parakeet_vad_t vad);
+parakeet_error_t parakeet_vad_to_gpu(parakeet_vad_t vad);
+parakeet_error_t parakeet_vad_to_half(parakeet_vad_t vad);
+
+/**
+ * Detect speech segments in audio.
+ * segments_out and count_out are set on success.
+ * Free segments with parakeet_speech_segments_free().
+ */
+parakeet_error_t parakeet_vad_detect(parakeet_vad_t vad,
+                                     parakeet_audio_t audio,
+                                     parakeet_vad_config_t config,
+                                     parakeet_speech_segment_t **segments_out,
+                                     int *count_out);
+
+/** Free speech segments returned by parakeet_vad_detect. */
+void parakeet_speech_segments_free(parakeet_speech_segment_t *segments);
+
+/** Enable VAD on a 110M transcriber. */
+parakeet_error_t parakeet_transcriber_enable_vad(
+    parakeet_transcriber_t t, const char *vad_weights_path);
+
+/** Enable VAD on a TDT 600M transcriber. */
+parakeet_error_t parakeet_tdt_transcriber_enable_vad(
+    parakeet_tdt_transcriber_t t, const char *vad_weights_path);
+
+/** Enable VAD on a diarized transcriber. */
+parakeet_error_t parakeet_diarized_transcriber_enable_vad(
+    parakeet_diarized_transcriber_t t, const char *vad_weights_path);
+
 /* ── Result Accessors ────────────────────────────────────────────────────── */
 
 /** Free a batch of results returned by transcribe_batch. */

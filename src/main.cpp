@@ -34,6 +34,8 @@ static void print_usage(const char *prog) {
         << "  --timestamps   Show word-level timestamps\n"
         << "  --streaming    Use streaming mode (eou/nemotron models)\n"
         << "  --latency N    Right context frames for nemotron (0/1/6/13)\n"
+        << "  --vad PATH     Enable Silero VAD with given weights file\n"
+        << "  --vad-threshold F  VAD speech threshold (default: 0.5)\n"
         << "\nBatch mode:\n"
         << "  Multiple audio files can be specified for batch inference.\n"
         << "  Supported for tdt-ctc-110m and tdt-600m models.\n"
@@ -48,7 +50,9 @@ static int run_tdt_ctc_110m(const std::string &weights_path,
                             const std::string &features_path, bool use_ctc,
                             bool use_gpu, bool use_fp16, bool show_timestamps,
                             const std::vector<std::string> &boost_phrases = {},
-                            float boost_score = 5.0f) {
+                            float boost_score = 5.0f,
+                            const std::string &vad_weights_path = {},
+                            float vad_threshold = 0.5f) {
     using namespace parakeet;
     using Clock = std::chrono::high_resolution_clock;
 
@@ -89,12 +93,43 @@ static int run_tdt_ctc_110m(const std::string &weights_path,
               << ", " << audio.num_samples << " samples, " << std::fixed
               << std::setprecision(1) << audio.duration << "s" << std::endl;
 
+    // VAD preprocessing
+    axiom::Tensor audio_samples = audio.samples;
+    std::unique_ptr<parakeet::audio::TimestampRemapper> remapper;
+    if (!vad_weights_path.empty()) {
+        parakeet::audio::SileroVAD silero_vad(vad_weights_path);
+        parakeet::audio::VADConfig vad_cfg;
+        vad_cfg.threshold = vad_threshold;
+        vad_cfg.neg_threshold = vad_threshold - 0.15f;
+        auto segments =
+            silero_vad.detect(audio.samples, audio.sample_rate, vad_cfg);
+        if (!segments.empty()) {
+            float speech_dur = 0;
+            for (const auto &s : segments)
+                speech_dur +=
+                    static_cast<float>(s.end_sample - s.start_sample) /
+                    audio.sample_rate;
+            std::cout << "VAD: " << segments.size() << " speech segments, "
+                      << std::fixed << std::setprecision(1) << speech_dur
+                      << "s speech / " << audio.duration << "s total ("
+                      << static_cast<int>(100 *
+                                          (1 - speech_dur / audio.duration))
+                      << "% filtered)" << std::endl;
+            audio_samples =
+                parakeet::audio::collect_speech(audio.samples, segments);
+            if (show_timestamps) {
+                remapper = std::make_unique<parakeet::audio::TimestampRemapper>(
+                    segments);
+            }
+        }
+    }
+
     auto t0 = Clock::now();
     axiom::Tensor features;
     if (!features_path.empty()) {
         features = axiom::io::numpy::load(features_path);
     } else {
-        features = preprocess_audio(audio.samples);
+        features = preprocess_audio(audio_samples);
     }
     auto t1 = Clock::now();
     std::cout << "Preprocessing: "
@@ -175,6 +210,13 @@ static int run_tdt_ctc_110m(const std::string &weights_path,
                      .count()
               << " ms" << std::endl;
 
+    // Remap timestamps if VAD was used
+    if (remapper && show_timestamps) {
+        for (auto &ts_vec : timestamped_tokens) {
+            ts_vec = remapper->remap_tokens(ts_vec);
+        }
+    }
+
     for (size_t b = 0; b < token_ids.size(); ++b) {
         const auto &tokens = token_ids[b];
         std::cout << "\n--- Transcription (" << tokens.size() << " tokens) ---"
@@ -207,13 +249,13 @@ static int run_tdt_ctc_110m(const std::string &weights_path,
 
 // ─── TDT-CTC 110M batch mode ────────────────────────────────────────────────
 
-static int
-run_tdt_ctc_110m_batch(const std::string &weights_path,
-                       const std::vector<std::string> &audio_paths,
-                       const std::string &vocab_path, bool use_ctc,
-                       bool use_gpu, bool use_fp16, bool show_timestamps,
-                       const std::vector<std::string> &boost_phrases = {},
-                       float boost_score = 5.0f) {
+static int run_tdt_ctc_110m_batch(
+    const std::string &weights_path,
+    const std::vector<std::string> &audio_paths, const std::string &vocab_path,
+    bool use_ctc, bool use_gpu, bool use_fp16, bool show_timestamps,
+    const std::vector<std::string> &boost_phrases = {},
+    float boost_score = 5.0f, const std::string &vad_weights_path = {},
+    float vad_threshold = 0.5f) {
     using namespace parakeet;
     using Clock = std::chrono::high_resolution_clock;
 
@@ -224,12 +266,18 @@ run_tdt_ctc_110m_batch(const std::string &weights_path,
         transcriber.to_half();
     if (use_gpu)
         transcriber.to_gpu();
+    if (!vad_weights_path.empty()) {
+        transcriber.enable_vad(vad_weights_path);
+        std::cout << "VAD enabled (threshold=" << vad_threshold << ")"
+                  << std::endl;
+    }
 
     TranscribeOptions opts;
     opts.decoder = use_ctc ? Decoder::CTC : Decoder::TDT;
     opts.timestamps = show_timestamps;
     opts.boost_phrases = boost_phrases;
     opts.boost_score = boost_score;
+    opts.use_vad = !vad_weights_path.empty();
 
     auto t0 = Clock::now();
     auto results = transcriber.transcribe_batch(audio_paths, opts);
@@ -265,7 +313,9 @@ static int run_tdt_600m(const std::string &weights_path,
                         const std::string &vocab_path, bool use_gpu,
                         bool use_fp16, bool show_timestamps,
                         const std::vector<std::string> &boost_phrases = {},
-                        float boost_score = 5.0f) {
+                        float boost_score = 5.0f,
+                        const std::string &vad_weights_path = {},
+                        float vad_threshold = 0.5f) {
     using namespace parakeet;
     using Clock = std::chrono::high_resolution_clock;
 
@@ -293,9 +343,41 @@ static int run_tdt_600m(const std::string &weights_path,
     }
 
     auto audio = read_audio(audio_path);
+
+    // VAD preprocessing
+    axiom::Tensor audio_samples = audio.samples;
+    std::unique_ptr<parakeet::audio::TimestampRemapper> remapper;
+    if (!vad_weights_path.empty()) {
+        parakeet::audio::SileroVAD silero_vad(vad_weights_path);
+        parakeet::audio::VADConfig vad_cfg;
+        vad_cfg.threshold = vad_threshold;
+        vad_cfg.neg_threshold = vad_threshold - 0.15f;
+        auto segments =
+            silero_vad.detect(audio.samples, audio.sample_rate, vad_cfg);
+        if (!segments.empty()) {
+            float speech_dur = 0;
+            for (const auto &s : segments)
+                speech_dur +=
+                    static_cast<float>(s.end_sample - s.start_sample) /
+                    audio.sample_rate;
+            std::cout << "VAD: " << segments.size() << " speech segments, "
+                      << std::fixed << std::setprecision(1) << speech_dur
+                      << "s speech / " << audio.duration << "s total ("
+                      << static_cast<int>(100 *
+                                          (1 - speech_dur / audio.duration))
+                      << "% filtered)" << std::endl;
+            audio_samples =
+                parakeet::audio::collect_speech(audio.samples, segments);
+            if (show_timestamps) {
+                remapper = std::make_unique<parakeet::audio::TimestampRemapper>(
+                    segments);
+            }
+        }
+    }
+
     AudioConfig audio_cfg;
     audio_cfg.n_mels = cfg.encoder.mel_bins;
-    auto features = preprocess_audio(audio.samples, audio_cfg);
+    auto features = preprocess_audio(audio_samples, audio_cfg);
     if (use_fp16)
         features = features.half();
     if (use_gpu)
@@ -342,6 +424,13 @@ static int run_tdt_600m(const std::string &weights_path,
                                                   cfg.durations, blank_id);
     }
 
+    // Remap timestamps if VAD was used
+    if (remapper && show_timestamps) {
+        for (auto &ts_vec : timestamped_tokens) {
+            ts_vec = remapper->remap_tokens(ts_vec);
+        }
+    }
+
     for (size_t b = 0; b < token_ids.size(); ++b) {
         std::cout << "\n--- Transcription (" << token_ids[b].size()
                   << " tokens) ---" << std::endl;
@@ -365,13 +454,13 @@ static int run_tdt_600m(const std::string &weights_path,
 
 // ─── TDT 600M batch mode ────────────────────────────────────────────────────
 
-static int
-run_tdt_600m_batch(const std::string &weights_path,
-                   const std::vector<std::string> &audio_paths,
-                   const std::string &vocab_path, bool use_gpu, bool use_fp16,
-                   bool show_timestamps,
-                   const std::vector<std::string> &boost_phrases = {},
-                   float boost_score = 5.0f) {
+static int run_tdt_600m_batch(
+    const std::string &weights_path,
+    const std::vector<std::string> &audio_paths, const std::string &vocab_path,
+    bool use_gpu, bool use_fp16, bool show_timestamps,
+    const std::vector<std::string> &boost_phrases = {},
+    float boost_score = 5.0f, const std::string &vad_weights_path = {},
+    float vad_threshold = 0.5f) {
     using namespace parakeet;
     using Clock = std::chrono::high_resolution_clock;
 
@@ -382,12 +471,18 @@ run_tdt_600m_batch(const std::string &weights_path,
         transcriber.to_half();
     if (use_gpu)
         transcriber.to_gpu();
+    if (!vad_weights_path.empty()) {
+        transcriber.enable_vad(vad_weights_path);
+        std::cout << "VAD enabled (threshold=" << vad_threshold << ")"
+                  << std::endl;
+    }
 
     TranscribeOptions opts;
     opts.decoder = Decoder::TDT;
     opts.timestamps = show_timestamps;
     opts.boost_phrases = boost_phrases;
     opts.boost_score = boost_score;
+    opts.use_vad = !vad_weights_path.empty();
 
     auto t0 = Clock::now();
     auto results = transcriber.transcribe_batch(audio_paths, opts);
@@ -688,7 +783,8 @@ static int run_diarized(const std::string &weights_path,
                         const std::string &audio_path,
                         const std::string &vocab_path,
                         const std::string &sortformer_weights_path,
-                        bool use_ctc, bool use_gpu, bool use_fp16) {
+                        bool use_ctc, bool use_gpu, bool use_fp16,
+                        const std::string &vad_weights_path = {}) {
     using namespace parakeet;
     using Clock = std::chrono::high_resolution_clock;
 
@@ -725,6 +821,11 @@ static int run_diarized(const std::string &weights_path,
                                                                            t0)
                          .count()
                   << " ms)" << std::endl;
+    }
+
+    if (!vad_weights_path.empty()) {
+        dt.enable_vad(vad_weights_path);
+        std::cout << "VAD enabled" << std::endl;
     }
 
     auto audio = read_audio(audio_path);
@@ -809,6 +910,8 @@ int main(int argc, char *argv[]) {
         std::string sortformer_weights_path;
         std::vector<std::string> boost_phrases;
         float boost_score = 5.0f;
+        std::string vad_weights_path;
+        float vad_threshold = 0.5f;
         std::vector<std::string> audio_paths;
 
         for (int i = 2; i < argc; ++i) {
@@ -839,6 +942,10 @@ int main(int argc, char *argv[]) {
                 boost_phrases.push_back(argv[++i]);
             } else if (arg == "--boost-score" && i + 1 < argc) {
                 boost_score = std::stof(argv[++i]);
+            } else if (arg == "--vad" && i + 1 < argc) {
+                vad_weights_path = argv[++i];
+            } else if (arg == "--vad-threshold" && i + 1 < argc) {
+                vad_threshold = std::stof(argv[++i]);
             } else if (arg.substr(0, 2) == "--") {
                 std::cerr << "Unknown option: " << arg << std::endl;
                 print_usage(argv[0]);
@@ -867,20 +974,23 @@ int main(int argc, char *argv[]) {
             if (audio_paths.size() > 1) {
                 return run_tdt_ctc_110m_batch(
                     weights_path, audio_paths, vocab_path, use_ctc, use_gpu,
-                    use_fp16, show_timestamps, boost_phrases, boost_score);
+                    use_fp16, show_timestamps, boost_phrases, boost_score,
+                    vad_weights_path, vad_threshold);
             }
-            return run_tdt_ctc_110m(
-                weights_path, audio_path, vocab_path, features_path, use_ctc,
-                use_gpu, use_fp16, show_timestamps, boost_phrases, boost_score);
+            return run_tdt_ctc_110m(weights_path, audio_path, vocab_path,
+                                    features_path, use_ctc, use_gpu, use_fp16,
+                                    show_timestamps, boost_phrases, boost_score,
+                                    vad_weights_path, vad_threshold);
         } else if (model_type == "tdt-600m") {
             if (audio_paths.size() > 1) {
                 return run_tdt_600m_batch(weights_path, audio_paths, vocab_path,
                                           use_gpu, use_fp16, show_timestamps,
-                                          boost_phrases, boost_score);
+                                          boost_phrases, boost_score,
+                                          vad_weights_path, vad_threshold);
             }
             return run_tdt_600m(weights_path, audio_path, vocab_path, use_gpu,
                                 use_fp16, show_timestamps, boost_phrases,
-                                boost_score);
+                                boost_score, vad_weights_path, vad_threshold);
         } else if (model_type == "rnnt-600m") {
             return run_rnnt_600m(weights_path, audio_path, vocab_path, use_gpu,
                                  use_fp16, show_timestamps);
@@ -896,7 +1006,7 @@ int main(int argc, char *argv[]) {
         } else if (model_type == "diarized") {
             return run_diarized(weights_path, audio_path, vocab_path,
                                 sortformer_weights_path, use_ctc, use_gpu,
-                                use_fp16);
+                                use_fp16, vad_weights_path);
         } else {
             std::cerr << "Unknown model type: " << model_type << std::endl;
             print_usage(argv[0]);
