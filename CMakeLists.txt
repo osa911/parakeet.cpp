@@ -34,24 +34,25 @@ add_subdirectory(third_party/axiom)
 
 # ── Parakeet library ─────────────────────────────────────────────────────────
 add_library(parakeet_lib
-    src/encoder.cpp
-    src/lstm.cpp
-    src/ctc.cpp
-    src/rnnt.cpp
-    src/tdt.cpp
-    src/tdt_ctc.cpp
-    src/audio.cpp
-    src/audio_io.cpp
-    src/vocab.cpp
-    src/timestamp.cpp
-    src/streaming_encoder.cpp
-    src/eou.cpp
-    src/nemotron.cpp
-    src/transformer.cpp
-    src/sortformer.cpp
-    src/diarize.cpp
-    src/phrase_boost.cpp
-    src/parakeet_c.cpp
+    src/audio/audio.cpp
+    src/audio/audio_io.cpp
+    src/models/encoder.cpp
+    src/models/streaming_encoder.cpp
+    src/models/lstm.cpp
+    src/models/transformer.cpp
+    src/models/ctc.cpp
+    src/models/rnnt.cpp
+    src/models/tdt.cpp
+    src/models/tdt_ctc.cpp
+    src/models/eou.cpp
+    src/models/nemotron.cpp
+    src/models/sortformer.cpp
+    src/decode/timestamp.cpp
+    src/decode/vocab.cpp
+    src/decode/phrase_boost.cpp
+    src/api/transcribe.cpp
+    src/api/diarize.cpp
+    src/api/parakeet_c.cpp
 )
 
 add_library(Parakeet::parakeet ALIAS parakeet_lib)

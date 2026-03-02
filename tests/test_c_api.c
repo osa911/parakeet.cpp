@@ -1,4 +1,4 @@
-#include <parakeet/parakeet_c.h>
+#include <parakeet/api/parakeet_c.h>
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>

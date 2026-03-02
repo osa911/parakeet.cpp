@@ -1,0 +1,465 @@
+#pragma once
+
+#include <string>
+#include <vector>
+
+#include <axiom/axiom.hpp>
+#include <axiom/io/safetensors.hpp>
+
+#include "parakeet/audio/audio.hpp"
+#include "parakeet/audio/audio_io.hpp"
+#include "parakeet/decode/phrase_boost.hpp"
+#include "parakeet/decode/timestamp.hpp"
+#include "parakeet/decode/vocab.hpp"
+#include "parakeet/models/config.hpp"
+#include "parakeet/models/ctc.hpp"
+#include "parakeet/models/eou.hpp"
+#include "parakeet/models/nemotron.hpp"
+#include "parakeet/models/tdt.hpp"
+#include "parakeet/models/tdt_ctc.hpp"
+
+namespace parakeet::api {
+
+using namespace models;
+using namespace decode;
+using namespace audio;
+
+// ─── Transcription Result ───────────────────────────────────────────────────
+
+struct TranscribeResult {
+    std::string text;           // Decoded text
+    std::vector<int> token_ids; // Raw token IDs before detokenization
+
+    // Optional timestamps (populated when timestamps=true)
+    std::vector<TimestampedToken> timestamped_tokens;
+    std::vector<WordTimestamp> word_timestamps;
+};
+
+// ─── High-Level Transcription API ───────────────────────────────────────────
+
+enum class Decoder { CTC, TDT };
+
+// ─── Transcription Options ──────────────────────────────────────────────────
+
+struct TranscribeOptions {
+    Decoder decoder = Decoder::TDT;
+    bool timestamps = false;
+    std::vector<std::string> boost_phrases;
+    float boost_score = 5.0f;
+};
+
+/// Transcribe an audio file to text using a ParakeetTDTCTC model.
+/// Supports WAV, FLAC, MP3, OGG. Automatically resamples to 16kHz.
+///
+/// This is the simplest entry point — loads audio, preprocesses, encodes,
+/// decodes, and detokenizes in one call.
+///
+///   parakeet::Transcriber t("model.safetensors", "vocab.txt");
+///   auto result = t.transcribe("audio.wav");
+///   std::cout << result.text << std::endl;
+///
+class Transcriber {
+  public:
+    /// Construct from a safetensors weights file and SentencePiece vocab file.
+    /// Uses the 110M TDT-CTC config by default.
+    Transcriber(const std::string &weights_path, const std::string &vocab_path,
+                const TDTCTCConfig &config = make_110m_config())
+        : config_(config), model_(config) {
+        auto weights = axiom::io::safetensors::load(weights_path);
+        model_.load_state_dict(weights, "", false);
+        tokenizer_.load(vocab_path);
+    }
+
+    /// Move model to GPU (Metal). Call once after construction.
+    void to_gpu() {
+        model_.to(axiom::Device::GPU);
+        use_gpu_ = true;
+    }
+
+    /// Cast model to fp16. Call before to_gpu() for efficient transfer.
+    void to_half() {
+        model_.to(axiom::DType::Float16);
+        use_fp16_ = true;
+    }
+
+    /// Transcribe an audio file (WAV, FLAC, MP3, OGG).
+    TranscribeResult transcribe(const std::string &audio_path,
+                                Decoder decoder = Decoder::TDT,
+                                bool timestamps = false) {
+        auto audio_data = read_audio(audio_path);
+        return transcribe(audio_data.samples, decoder, timestamps);
+    }
+
+    /// Transcribe from raw float32 samples (16kHz mono).
+    TranscribeResult transcribe(const axiom::Tensor &samples,
+                                Decoder decoder = Decoder::TDT,
+                                bool timestamps = false) {
+        TranscribeOptions opts;
+        opts.decoder = decoder;
+        opts.timestamps = timestamps;
+        return transcribe(samples, opts);
+    }
+
+    /// Transcribe an audio file with options (boost phrases, etc.).
+    TranscribeResult transcribe(const std::string &audio_path,
+                                const TranscribeOptions &opts) {
+        auto audio_data = read_audio(audio_path);
+        return transcribe(audio_data.samples, opts);
+    }
+
+    /// Transcribe from raw float32 samples with options.
+    TranscribeResult transcribe(const axiom::Tensor &samples,
+                                const TranscribeOptions &opts) {
+        AudioConfig audio_cfg;
+        audio_cfg.n_mels = config_.encoder.mel_bins;
+        auto features = preprocess_audio(samples, audio_cfg);
+        if (use_fp16_)
+            features = features.half();
+        if (use_gpu_) {
+            features = features.gpu();
+        }
+
+        auto encoder_out = model_.encoder()(features);
+
+        // Build trie if boost phrases provided
+        ContextTrie trie;
+        bool use_boost = !opts.boost_phrases.empty();
+        if (use_boost) {
+            trie.build(opts.boost_phrases, tokenizer_);
+        }
+
+        TranscribeResult result;
+
+        if (opts.timestamps) {
+            if (opts.decoder == Decoder::CTC) {
+                auto log_probs = model_.ctc_decoder()(encoder_out);
+                auto cpu_lp = log_probs.cpu();
+                auto all_ts = use_boost
+                                  ? ctc_greedy_decode_with_timestamps_boosted(
+                                        cpu_lp, trie, opts.boost_score)
+                                  : ctc_greedy_decode_with_timestamps(cpu_lp);
+                if (!all_ts.empty()) {
+                    result.timestamped_tokens = all_ts[0];
+                    for (const auto &t : result.timestamped_tokens) {
+                        result.token_ids.push_back(t.token_id);
+                    }
+                }
+            } else {
+                auto all_ts = use_boost
+                                  ? tdt_greedy_decode_with_timestamps_boosted(
+                                        model_, encoder_out, config_.durations,
+                                        trie, opts.boost_score)
+                                  : tdt_greedy_decode_with_timestamps(
+                                        model_, encoder_out, config_.durations);
+                if (!all_ts.empty()) {
+                    result.timestamped_tokens = all_ts[0];
+                    for (const auto &t : result.timestamped_tokens) {
+                        result.token_ids.push_back(t.token_id);
+                    }
+                }
+            }
+
+            if (tokenizer_.loaded()) {
+                result.text = tokenizer_.decode(result.token_ids);
+                result.word_timestamps = group_timestamps(
+                    result.timestamped_tokens, tokenizer_.pieces());
+            }
+        } else {
+            std::vector<std::vector<int>> all_tokens;
+            if (opts.decoder == Decoder::CTC) {
+                auto log_probs = model_.ctc_decoder()(encoder_out);
+                auto cpu_lp = log_probs.cpu();
+                all_tokens = use_boost ? ctc_greedy_decode_boosted(
+                                             cpu_lp, trie, opts.boost_score)
+                                       : ctc_greedy_decode(cpu_lp);
+            } else {
+                all_tokens = use_boost
+                                 ? tdt_greedy_decode_boosted(
+                                       model_, encoder_out, config_.durations,
+                                       trie, opts.boost_score)
+                                 : tdt_greedy_decode(model_, encoder_out,
+                                                     config_.durations);
+            }
+
+            if (!all_tokens.empty()) {
+                result.token_ids = all_tokens[0];
+                if (tokenizer_.loaded()) {
+                    result.text = tokenizer_.decode(result.token_ids);
+                }
+            }
+        }
+
+        return result;
+    }
+
+    /// Access the underlying model for advanced use.
+    ParakeetTDTCTC &model() { return model_; }
+    const Tokenizer &tokenizer() const { return tokenizer_; }
+
+  private:
+    TDTCTCConfig config_;
+    ParakeetTDTCTC model_;
+    Tokenizer tokenizer_;
+    bool use_gpu_ = false;
+    bool use_fp16_ = false;
+};
+
+// ─── TDT-Only Transcriber (for 600M multilingual etc.) ─────────────────────
+
+/// Transcribe using a TDT-only model (no CTC head).
+///
+///   parakeet::TDTTranscriber t("model.safetensors", "vocab.txt",
+///                               parakeet::make_tdt_600m_config());
+///   auto result = t.transcribe("audio.wav");
+///
+class TDTTranscriber {
+  public:
+    TDTTranscriber(const std::string &weights_path,
+                   const std::string &vocab_path,
+                   const TDTConfig &config = make_tdt_600m_config())
+        : config_(config), model_(config) {
+        auto weights = axiom::io::safetensors::load(weights_path);
+        model_.load_state_dict(weights, "", false);
+        tokenizer_.load(vocab_path);
+    }
+
+    void to_gpu() {
+        model_.to(axiom::Device::GPU);
+        use_gpu_ = true;
+    }
+
+    void to_half() {
+        model_.to(axiom::DType::Float16);
+        use_fp16_ = true;
+    }
+
+    TranscribeResult transcribe(const std::string &audio_path,
+                                bool timestamps = false) {
+        auto audio_data = read_audio(audio_path);
+        return transcribe(audio_data.samples, timestamps);
+    }
+
+    TranscribeResult transcribe(const axiom::Tensor &samples,
+                                bool timestamps = false) {
+        TranscribeOptions opts;
+        opts.decoder = Decoder::TDT;
+        opts.timestamps = timestamps;
+        return transcribe(samples, opts);
+    }
+
+    TranscribeResult transcribe(const std::string &audio_path,
+                                const TranscribeOptions &opts) {
+        auto audio_data = read_audio(audio_path);
+        return transcribe(audio_data.samples, opts);
+    }
+
+    TranscribeResult transcribe(const axiom::Tensor &samples,
+                                const TranscribeOptions &opts) {
+        AudioConfig audio_cfg;
+        audio_cfg.n_mels = config_.encoder.mel_bins;
+        auto features = preprocess_audio(samples, audio_cfg);
+        if (use_fp16_)
+            features = features.half();
+        if (use_gpu_) {
+            features = features.gpu();
+        }
+
+        auto encoder_out = model_.encoder()(features);
+
+        ContextTrie trie;
+        bool use_boost = !opts.boost_phrases.empty();
+        if (use_boost) {
+            trie.build(opts.boost_phrases, tokenizer_);
+        }
+
+        TranscribeResult result;
+
+        if (opts.timestamps) {
+            auto all_ts = use_boost
+                              ? tdt_greedy_decode_with_timestamps_boosted(
+                                    model_, encoder_out, config_.durations,
+                                    trie, opts.boost_score)
+                              : tdt_greedy_decode_with_timestamps(
+                                    model_, encoder_out, config_.durations);
+            if (!all_ts.empty()) {
+                result.timestamped_tokens = all_ts[0];
+                for (const auto &t : result.timestamped_tokens) {
+                    result.token_ids.push_back(t.token_id);
+                }
+            }
+            if (tokenizer_.loaded()) {
+                result.text = tokenizer_.decode(result.token_ids);
+                result.word_timestamps = group_timestamps(
+                    result.timestamped_tokens, tokenizer_.pieces());
+            }
+        } else {
+            auto all_tokens =
+                use_boost
+                    ? tdt_greedy_decode_boosted(model_, encoder_out,
+                                                config_.durations, trie,
+                                                opts.boost_score)
+                    : tdt_greedy_decode(model_, encoder_out, config_.durations);
+            if (!all_tokens.empty()) {
+                result.token_ids = all_tokens[0];
+                if (tokenizer_.loaded()) {
+                    result.text = tokenizer_.decode(result.token_ids);
+                }
+            }
+        }
+
+        return result;
+    }
+
+    ParakeetTDT &model() { return model_; }
+    const Tokenizer &tokenizer() const { return tokenizer_; }
+
+  private:
+    TDTConfig config_;
+    ParakeetTDT model_;
+    Tokenizer tokenizer_;
+    bool use_gpu_ = false;
+    bool use_fp16_ = false;
+};
+
+// ─── Streaming Transcriber ───────────────────────────────────────────────────
+
+// Callback for partial transcription results.
+using PartialResultCallback = std::function<void(const std::string &partial)>;
+
+class StreamingTranscriber {
+  public:
+    StreamingTranscriber(const std::string &weights_path,
+                         const std::string &vocab_path,
+                         const EOUConfig &config = make_eou_120m_config());
+
+    void to_gpu() {
+        model_.to(axiom::Device::GPU);
+        use_gpu_ = true;
+    }
+
+    void to_half() {
+        model_.to(axiom::DType::Float16);
+        use_fp16_ = true;
+    }
+
+    // Process a chunk of raw audio samples.
+    // Returns any new text produced by this chunk.
+    std::string transcribe_chunk(const axiom::Tensor &samples);
+
+    // Convenience: process raw float32 PCM buffer.
+    std::string transcribe_chunk(const float *data, size_t num_samples) {
+        auto t =
+            axiom::Tensor::from_data(data, axiom::Shape{num_samples}, true);
+        return transcribe_chunk(t);
+    }
+
+    // Convenience: process raw int16 PCM buffer (converted to float32).
+    std::string transcribe_chunk(const int16_t *data, size_t num_samples) {
+        std::vector<float> f(num_samples);
+        for (size_t i = 0; i < num_samples; ++i)
+            f[i] = static_cast<float>(data[i]) / 32768.0f;
+        auto t =
+            axiom::Tensor::from_data(f.data(), axiom::Shape{num_samples}, true);
+        return transcribe_chunk(t);
+    }
+
+    // Reset state for a new utterance.
+    void reset();
+
+    // Set callback for partial results (called each time new tokens are
+    // emitted).
+    void set_partial_callback(PartialResultCallback cb) {
+        partial_callback_ = std::move(cb);
+    }
+
+    // Get full transcription so far.
+    std::string get_text() const;
+
+    // Get accumulated timestamped tokens across all chunks.
+    const std::vector<TimestampedToken> &get_timestamped_tokens() const {
+        return decode_state_.timestamped_tokens;
+    }
+
+    ParakeetEOU &model() { return model_; }
+    const Tokenizer &tokenizer() const { return tokenizer_; }
+
+  private:
+    EOUConfig config_;
+    ParakeetEOU model_;
+    Tokenizer tokenizer_;
+    StreamingAudioPreprocessor preprocessor_;
+    EncoderCache encoder_cache_;
+    StreamingDecodeState decode_state_;
+    bool use_gpu_ = false;
+    bool use_fp16_ = false;
+    PartialResultCallback partial_callback_;
+};
+
+// ─── Nemotron Streaming Transcriber ──────────────────────────────────────────
+
+class NemotronTranscriber {
+  public:
+    NemotronTranscriber(
+        const std::string &weights_path, const std::string &vocab_path,
+        const NemotronConfig &config = make_nemotron_600m_config());
+
+    void to_gpu() {
+        model_.to(axiom::Device::GPU);
+        use_gpu_ = true;
+    }
+
+    void to_half() {
+        model_.to(axiom::DType::Float16);
+        use_fp16_ = true;
+    }
+
+    // Process a chunk of raw audio → returns new text from this chunk
+    std::string transcribe_chunk(const axiom::Tensor &samples);
+
+    // Convenience: process raw float32 PCM buffer.
+    std::string transcribe_chunk(const float *data, size_t num_samples) {
+        auto t =
+            axiom::Tensor::from_data(data, axiom::Shape{num_samples}, true);
+        return transcribe_chunk(t);
+    }
+
+    // Convenience: process raw int16 PCM buffer (converted to float32).
+    std::string transcribe_chunk(const int16_t *data, size_t num_samples) {
+        std::vector<float> f(num_samples);
+        for (size_t i = 0; i < num_samples; ++i)
+            f[i] = static_cast<float>(data[i]) / 32768.0f;
+        auto t =
+            axiom::Tensor::from_data(f.data(), axiom::Shape{num_samples}, true);
+        return transcribe_chunk(t);
+    }
+
+    // Reset for a new utterance
+    void reset();
+
+    // Get full transcription so far
+    std::string get_text() const;
+
+    void set_partial_callback(PartialResultCallback cb) {
+        partial_callback_ = std::move(cb);
+    }
+
+    const std::vector<TimestampedToken> &get_timestamped_tokens() const {
+        return decode_state_.timestamped_tokens;
+    }
+
+    ParakeetNemotron &model() { return model_; }
+    const Tokenizer &tokenizer() const { return tokenizer_; }
+
+  private:
+    NemotronConfig config_;
+    ParakeetNemotron model_;
+    Tokenizer tokenizer_;
+    StreamingAudioPreprocessor preprocessor_;
+    EncoderCache encoder_cache_;
+    StreamingDecodeState decode_state_;
+    bool use_gpu_ = false;
+    bool use_fp16_ = false;
+    PartialResultCallback partial_callback_;
+};
+
+} // namespace parakeet::api
