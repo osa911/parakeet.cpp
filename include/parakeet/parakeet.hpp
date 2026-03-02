@@ -5,6 +5,7 @@
 // Audio
 #include "parakeet/audio/audio.hpp"
 #include "parakeet/audio/audio_io.hpp"
+#include "parakeet/audio/vad.hpp"
 
 // Models
 #include "parakeet/models/config.hpp"
@@ -14,6 +15,7 @@
 #include "parakeet/models/lstm.hpp"
 #include "parakeet/models/nemotron.hpp"
 #include "parakeet/models/rnnt.hpp"
+#include "parakeet/models/silero_vad.hpp"
 #include "parakeet/models/sortformer.hpp"
 #include "parakeet/models/streaming_encoder.hpp"
 #include "parakeet/models/tdt.hpp"
