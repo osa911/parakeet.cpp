@@ -13,17 +13,19 @@ ParakeetTDTCTC::ParakeetTDTCTC(const TDTCTCConfig &config)
 std::vector<std::vector<int>>
 tdt_greedy_decode(ParakeetTDTCTC &model, const Tensor &encoder_out,
                   const std::vector<int> &durations, int blank_id,
-                  int max_symbols_per_step) {
+                  int max_symbols_per_step, const std::vector<int> &lengths) {
     return tdt_greedy_decode(model.prediction(), model.tdt_joint(), encoder_out,
-                             durations, blank_id, max_symbols_per_step);
+                             durations, blank_id, max_symbols_per_step,
+                             lengths);
 }
 
 std::vector<std::vector<TimestampedToken>> tdt_greedy_decode_with_timestamps(
     ParakeetTDTCTC &model, const Tensor &encoder_out,
-    const std::vector<int> &durations, int blank_id, int max_symbols_per_step) {
+    const std::vector<int> &durations, int blank_id, int max_symbols_per_step,
+    const std::vector<int> &lengths) {
     return tdt_greedy_decode_with_timestamps(
         model.prediction(), model.tdt_joint(), encoder_out, durations, blank_id,
-        max_symbols_per_step);
+        max_symbols_per_step, lengths);
 }
 
 } // namespace parakeet::models

@@ -64,61 +64,60 @@ class ContextTrie {
 
 std::vector<std::vector<int>>
 ctc_greedy_decode_boosted(const Tensor &log_probs, const ContextTrie &trie,
-                          float boost_score = 5.0f, int blank_id = 1024);
+                          float boost_score = 5.0f, int blank_id = 1024,
+                          const std::vector<int> &lengths = {});
 
 std::vector<std::vector<TimestampedToken>>
 ctc_greedy_decode_with_timestamps_boosted(const Tensor &log_probs,
                                           const ContextTrie &trie,
                                           float boost_score = 5.0f,
-                                          int blank_id = 1024);
+                                          int blank_id = 1024,
+                                          const std::vector<int> &lengths = {});
 
 // ─── Boosted TDT Decode ────────────────────────────────────────────────────
 
 // Component-based
-std::vector<std::vector<int>>
-tdt_greedy_decode_boosted(RNNTPrediction &prediction, TDTJoint &joint,
-                          const Tensor &encoder_out,
-                          const std::vector<int> &durations,
-                          const ContextTrie &trie, float boost_score = 5.0f,
-                          int blank_id = 1024, int max_symbols_per_step = 10);
+std::vector<std::vector<int>> tdt_greedy_decode_boosted(
+    RNNTPrediction &prediction, TDTJoint &joint, const Tensor &encoder_out,
+    const std::vector<int> &durations, const ContextTrie &trie,
+    float boost_score = 5.0f, int blank_id = 1024,
+    int max_symbols_per_step = 10, const std::vector<int> &lengths = {});
 
 std::vector<std::vector<TimestampedToken>>
 tdt_greedy_decode_with_timestamps_boosted(
     RNNTPrediction &prediction, TDTJoint &joint, const Tensor &encoder_out,
     const std::vector<int> &durations, const ContextTrie &trie,
     float boost_score = 5.0f, int blank_id = 1024,
-    int max_symbols_per_step = 10);
+    int max_symbols_per_step = 10, const std::vector<int> &lengths = {});
 
 // Convenience: ParakeetTDT
 std::vector<std::vector<int>>
 tdt_greedy_decode_boosted(ParakeetTDT &model, const Tensor &encoder_out,
                           const std::vector<int> &durations,
                           const ContextTrie &trie, float boost_score = 5.0f,
-                          int blank_id = 1024, int max_symbols_per_step = 10);
+                          int blank_id = 1024, int max_symbols_per_step = 10,
+                          const std::vector<int> &lengths = {});
 
 std::vector<std::vector<TimestampedToken>>
-tdt_greedy_decode_with_timestamps_boosted(ParakeetTDT &model,
-                                          const Tensor &encoder_out,
-                                          const std::vector<int> &durations,
-                                          const ContextTrie &trie,
-                                          float boost_score = 5.0f,
-                                          int blank_id = 1024,
-                                          int max_symbols_per_step = 10);
+tdt_greedy_decode_with_timestamps_boosted(
+    ParakeetTDT &model, const Tensor &encoder_out,
+    const std::vector<int> &durations, const ContextTrie &trie,
+    float boost_score = 5.0f, int blank_id = 1024,
+    int max_symbols_per_step = 10, const std::vector<int> &lengths = {});
 
 // Convenience: ParakeetTDTCTC
 std::vector<std::vector<int>>
 tdt_greedy_decode_boosted(ParakeetTDTCTC &model, const Tensor &encoder_out,
                           const std::vector<int> &durations,
                           const ContextTrie &trie, float boost_score = 5.0f,
-                          int blank_id = 1024, int max_symbols_per_step = 10);
+                          int blank_id = 1024, int max_symbols_per_step = 10,
+                          const std::vector<int> &lengths = {});
 
 std::vector<std::vector<TimestampedToken>>
-tdt_greedy_decode_with_timestamps_boosted(ParakeetTDTCTC &model,
-                                          const Tensor &encoder_out,
-                                          const std::vector<int> &durations,
-                                          const ContextTrie &trie,
-                                          float boost_score = 5.0f,
-                                          int blank_id = 1024,
-                                          int max_symbols_per_step = 10);
+tdt_greedy_decode_with_timestamps_boosted(
+    ParakeetTDTCTC &model, const Tensor &encoder_out,
+    const std::vector<int> &durations, const ContextTrie &trie,
+    float boost_score = 5.0f, int blank_id = 1024,
+    int max_symbols_per_step = 10, const std::vector<int> &lengths = {});
 
 } // namespace parakeet::decode

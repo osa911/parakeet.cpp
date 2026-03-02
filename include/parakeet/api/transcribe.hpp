@@ -192,6 +192,134 @@ class Transcriber {
         return result;
     }
 
+    /// Batch transcribe multiple audio files.
+    std::vector<TranscribeResult>
+    transcribe_batch(const std::vector<std::string> &audio_paths,
+                     const TranscribeOptions &opts = {}) {
+        std::vector<axiom::Tensor> waveforms;
+        waveforms.reserve(audio_paths.size());
+        for (const auto &path : audio_paths) {
+            auto audio_data = read_audio(path);
+            waveforms.push_back(audio_data.samples);
+        }
+        return transcribe_batch(waveforms, opts);
+    }
+
+    /// Batch transcribe from multiple raw sample tensors.
+    std::vector<TranscribeResult>
+    transcribe_batch(const std::vector<axiom::Tensor> &samples,
+                     const TranscribeOptions &opts = {}) {
+        if (samples.empty())
+            return {};
+        if (samples.size() == 1) {
+            return {transcribe(samples[0], opts)};
+        }
+
+        AudioConfig audio_cfg;
+        audio_cfg.n_mels = config_.encoder.mel_bins;
+        auto batch = preprocess_audio_batch(samples, audio_cfg);
+
+        // Compute subsampled lengths
+        std::vector<int> sub_lengths;
+        int max_sub_len = 0;
+        sub_lengths.reserve(batch.feature_lengths.size());
+        for (int fl : batch.feature_lengths) {
+            int sl = compute_subsampled_length(fl);
+            sub_lengths.push_back(sl);
+            if (sl > max_sub_len)
+                max_sub_len = sl;
+        }
+
+        auto mask = create_padding_mask(sub_lengths, max_sub_len);
+        auto features = batch.features;
+
+        if (use_fp16_) {
+            features = features.half();
+            mask = mask.half();
+        }
+        if (use_gpu_) {
+            features = features.gpu();
+            mask = mask.gpu();
+        }
+
+        auto encoder_out = model_.encoder()(features, mask);
+
+        ContextTrie trie;
+        bool use_boost = !opts.boost_phrases.empty();
+        if (use_boost) {
+            trie.build(opts.boost_phrases, tokenizer_);
+        }
+
+        std::vector<TranscribeResult> results(samples.size());
+
+        if (opts.timestamps) {
+            if (opts.decoder == Decoder::CTC) {
+                auto log_probs = model_.ctc_decoder()(encoder_out);
+                auto cpu_lp = log_probs.cpu();
+                auto all_ts =
+                    use_boost
+                        ? ctc_greedy_decode_with_timestamps_boosted(
+                              cpu_lp, trie, opts.boost_score, 1024, sub_lengths)
+                        : ctc_greedy_decode_with_timestamps(cpu_lp, 1024,
+                                                            sub_lengths);
+                for (size_t b = 0; b < all_ts.size(); ++b) {
+                    results[b].timestamped_tokens = all_ts[b];
+                    for (const auto &t : all_ts[b])
+                        results[b].token_ids.push_back(t.token_id);
+                }
+            } else {
+                auto all_ts =
+                    use_boost
+                        ? tdt_greedy_decode_with_timestamps_boosted(
+                              model_, encoder_out, config_.durations, trie,
+                              opts.boost_score, 1024, 10, sub_lengths)
+                        : tdt_greedy_decode_with_timestamps(
+                              model_, encoder_out, config_.durations, 1024, 10,
+                              sub_lengths);
+                for (size_t b = 0; b < all_ts.size(); ++b) {
+                    results[b].timestamped_tokens = all_ts[b];
+                    for (const auto &t : all_ts[b])
+                        results[b].token_ids.push_back(t.token_id);
+                }
+            }
+            for (size_t b = 0; b < results.size(); ++b) {
+                if (tokenizer_.loaded()) {
+                    results[b].text = tokenizer_.decode(results[b].token_ids);
+                    results[b].word_timestamps = group_timestamps(
+                        results[b].timestamped_tokens, tokenizer_.pieces());
+                }
+            }
+        } else {
+            std::vector<std::vector<int>> all_tokens;
+            if (opts.decoder == Decoder::CTC) {
+                auto log_probs = model_.ctc_decoder()(encoder_out);
+                auto cpu_lp = log_probs.cpu();
+                all_tokens = use_boost
+                                 ? ctc_greedy_decode_boosted(cpu_lp, trie,
+                                                             opts.boost_score,
+                                                             1024, sub_lengths)
+                                 : ctc_greedy_decode(cpu_lp, 1024, sub_lengths);
+            } else {
+                all_tokens =
+                    use_boost
+                        ? tdt_greedy_decode_boosted(
+                              model_, encoder_out, config_.durations, trie,
+                              opts.boost_score, 1024, 10, sub_lengths)
+                        : tdt_greedy_decode(model_, encoder_out,
+                                            config_.durations, 1024, 10,
+                                            sub_lengths);
+            }
+            for (size_t b = 0; b < all_tokens.size(); ++b) {
+                results[b].token_ids = all_tokens[b];
+                if (tokenizer_.loaded()) {
+                    results[b].text = tokenizer_.decode(results[b].token_ids);
+                }
+            }
+        }
+
+        return results;
+    }
+
     /// Access the underlying model for advanced use.
     ParakeetTDTCTC &model() { return model_; }
     const Tokenizer &tokenizer() const { return tokenizer_; }
@@ -308,6 +436,105 @@ class TDTTranscriber {
         }
 
         return result;
+    }
+
+    /// Batch transcribe multiple audio files.
+    std::vector<TranscribeResult>
+    transcribe_batch(const std::vector<std::string> &audio_paths,
+                     const TranscribeOptions &opts = {}) {
+        std::vector<axiom::Tensor> waveforms;
+        waveforms.reserve(audio_paths.size());
+        for (const auto &path : audio_paths) {
+            auto audio_data = read_audio(path);
+            waveforms.push_back(audio_data.samples);
+        }
+        return transcribe_batch(waveforms, opts);
+    }
+
+    /// Batch transcribe from multiple raw sample tensors.
+    std::vector<TranscribeResult>
+    transcribe_batch(const std::vector<axiom::Tensor> &samples,
+                     const TranscribeOptions &opts = {}) {
+        if (samples.empty())
+            return {};
+        if (samples.size() == 1) {
+            return {transcribe(samples[0], opts)};
+        }
+
+        AudioConfig audio_cfg;
+        audio_cfg.n_mels = config_.encoder.mel_bins;
+        auto batch = preprocess_audio_batch(samples, audio_cfg);
+
+        std::vector<int> sub_lengths;
+        int max_sub_len = 0;
+        sub_lengths.reserve(batch.feature_lengths.size());
+        for (int fl : batch.feature_lengths) {
+            int sl = compute_subsampled_length(fl);
+            sub_lengths.push_back(sl);
+            if (sl > max_sub_len)
+                max_sub_len = sl;
+        }
+
+        auto mask = create_padding_mask(sub_lengths, max_sub_len);
+        auto features = batch.features;
+
+        if (use_fp16_) {
+            features = features.half();
+            mask = mask.half();
+        }
+        if (use_gpu_) {
+            features = features.gpu();
+            mask = mask.gpu();
+        }
+
+        auto encoder_out = model_.encoder()(features, mask);
+
+        ContextTrie trie;
+        bool use_boost = !opts.boost_phrases.empty();
+        if (use_boost) {
+            trie.build(opts.boost_phrases, tokenizer_);
+        }
+
+        int blank_id = config_.prediction.vocab_size - 1;
+        std::vector<TranscribeResult> results(samples.size());
+
+        if (opts.timestamps) {
+            auto all_ts =
+                use_boost ? tdt_greedy_decode_with_timestamps_boosted(
+                                model_, encoder_out, config_.durations, trie,
+                                opts.boost_score, blank_id, 10, sub_lengths)
+                          : tdt_greedy_decode_with_timestamps(
+                                model_, encoder_out, config_.durations,
+                                blank_id, 10, sub_lengths);
+            for (size_t b = 0; b < all_ts.size(); ++b) {
+                results[b].timestamped_tokens = all_ts[b];
+                for (const auto &t : all_ts[b])
+                    results[b].token_ids.push_back(t.token_id);
+            }
+            for (size_t b = 0; b < results.size(); ++b) {
+                if (tokenizer_.loaded()) {
+                    results[b].text = tokenizer_.decode(results[b].token_ids);
+                    results[b].word_timestamps = group_timestamps(
+                        results[b].timestamped_tokens, tokenizer_.pieces());
+                }
+            }
+        } else {
+            auto all_tokens =
+                use_boost
+                    ? tdt_greedy_decode_boosted(
+                          model_, encoder_out, config_.durations, trie,
+                          opts.boost_score, blank_id, 10, sub_lengths)
+                    : tdt_greedy_decode(model_, encoder_out, config_.durations,
+                                        blank_id, 10, sub_lengths);
+            for (size_t b = 0; b < all_tokens.size(); ++b) {
+                results[b].token_ids = all_tokens[b];
+                if (tokenizer_.loaded()) {
+                    results[b].text = tokenizer_.decode(results[b].token_ids);
+                }
+            }
+        }
+
+        return results;
     }
 
     ParakeetTDT &model() { return model_; }

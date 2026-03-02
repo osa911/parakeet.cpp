@@ -69,10 +69,10 @@ ContextTrie::advance(const std::unordered_set<int> &active_states,
 
 // ─── Boosted CTC Greedy Decode ─────────────────────────────────────────────
 
-std::vector<std::vector<int>> ctc_greedy_decode_boosted(const Tensor &log_probs,
-                                                        const ContextTrie &trie,
-                                                        float boost_score,
-                                                        int blank_id) {
+std::vector<std::vector<int>>
+ctc_greedy_decode_boosted(const Tensor &log_probs, const ContextTrie &trie,
+                          float boost_score, int blank_id,
+                          const std::vector<int> &lengths) {
     auto lp = log_probs.to_float().ascontiguousarray();
     auto shape = lp.shape();
     int batch_size = static_cast<int>(shape[0]);
@@ -86,8 +86,11 @@ std::vector<std::vector<int>> ctc_greedy_decode_boosted(const Tensor &log_probs,
         std::vector<int> &tokens = results[b];
         int prev = -1;
         std::unordered_set<int> active_states = {0};
+        int T = (!lengths.empty() && b < static_cast<int>(lengths.size()))
+                    ? lengths[b]
+                    : seq_len;
 
-        for (int t = 0; t < seq_len; ++t) {
+        for (int t = 0; t < T; ++t) {
             const float *frame = data + (b * seq_len + t) * vocab_size;
 
             // Get boosted tokens from trie
@@ -121,7 +124,8 @@ std::vector<std::vector<int>> ctc_greedy_decode_boosted(const Tensor &log_probs,
 std::vector<std::vector<TimestampedToken>>
 ctc_greedy_decode_with_timestamps_boosted(const Tensor &log_probs,
                                           const ContextTrie &trie,
-                                          float boost_score, int blank_id) {
+                                          float boost_score, int blank_id,
+                                          const std::vector<int> &lengths) {
     auto lp = log_probs.to_float().ascontiguousarray();
     auto shape = lp.shape();
     int batch_size = static_cast<int>(shape[0]);
@@ -135,8 +139,11 @@ ctc_greedy_decode_with_timestamps_boosted(const Tensor &log_probs,
         auto &tokens = results[b];
         int prev = -1;
         std::unordered_set<int> active_states = {0};
+        int T = (!lengths.empty() && b < static_cast<int>(lengths.size()))
+                    ? lengths[b]
+                    : seq_len;
 
-        for (int t = 0; t < seq_len; ++t) {
+        for (int t = 0; t < T; ++t) {
             const float *frame = data + (b * seq_len + t) * vocab_size;
 
             auto boosted = trie.get_boosted_tokens(active_states);
@@ -167,7 +174,7 @@ ctc_greedy_decode_with_timestamps_boosted(const Tensor &log_probs,
         }
 
         if (!tokens.empty()) {
-            tokens.back().end_frame = seq_len - 1;
+            tokens.back().end_frame = T - 1;
         }
     }
 
@@ -179,7 +186,8 @@ ctc_greedy_decode_with_timestamps_boosted(const Tensor &log_probs,
 std::vector<std::vector<int>> tdt_greedy_decode_boosted(
     RNNTPrediction &prediction, TDTJoint &joint, const Tensor &encoder_out,
     const std::vector<int> &durations, const ContextTrie &trie,
-    float boost_score, int blank_id, int max_symbols_per_step) {
+    float boost_score, int blank_id, int max_symbols_per_step,
+    const std::vector<int> &lengths) {
     auto shape = encoder_out.shape();
     int batch_size = static_cast<int>(shape[0]);
     int seq_len = static_cast<int>(shape[1]);
@@ -188,6 +196,9 @@ std::vector<std::vector<int>> tdt_greedy_decode_boosted(
 
     for (int b = 0; b < batch_size; ++b) {
         auto enc = encoder_out.slice({Slice(b, b + 1)});
+        int T = (!lengths.empty() && b < static_cast<int>(lengths.size()))
+                    ? lengths[b]
+                    : seq_len;
 
         int num_layers = prediction.config().num_lstm_layers;
         size_t hs = prediction.config().pred_hidden;
@@ -202,7 +213,7 @@ std::vector<std::vector<int>> tdt_greedy_decode_boosted(
         int t = 0;
         std::unordered_set<int> active_states = {0};
 
-        while (t < seq_len) {
+        while (t < T) {
             auto enc_t = enc.slice({Slice(), Slice(t, t + 1)});
 
             for (int sym = 0; sym < max_symbols_per_step; ++sym) {
@@ -268,7 +279,8 @@ std::vector<std::vector<TimestampedToken>>
 tdt_greedy_decode_with_timestamps_boosted(
     RNNTPrediction &prediction, TDTJoint &joint, const Tensor &encoder_out,
     const std::vector<int> &durations, const ContextTrie &trie,
-    float boost_score, int blank_id, int max_symbols_per_step) {
+    float boost_score, int blank_id, int max_symbols_per_step,
+    const std::vector<int> &lengths) {
     auto shape = encoder_out.shape();
     int batch_size = static_cast<int>(shape[0]);
     int seq_len = static_cast<int>(shape[1]);
@@ -277,6 +289,9 @@ tdt_greedy_decode_with_timestamps_boosted(
 
     for (int b = 0; b < batch_size; ++b) {
         auto enc = encoder_out.slice({Slice(b, b + 1)});
+        int T = (!lengths.empty() && b < static_cast<int>(lengths.size()))
+                    ? lengths[b]
+                    : seq_len;
 
         int num_layers = prediction.config().num_lstm_layers;
         size_t hs = prediction.config().pred_hidden;
@@ -291,7 +306,7 @@ tdt_greedy_decode_with_timestamps_boosted(
         int t = 0;
         std::unordered_set<int> active_states = {0};
 
-        while (t < seq_len) {
+        while (t < T) {
             auto enc_t = enc.slice({Slice(), Slice(t, t + 1)});
 
             for (int sym = 0; sym < max_symbols_per_step; ++sym) {
@@ -339,8 +354,8 @@ tdt_greedy_decode_with_timestamps_boosted(
                 }
 
                 int end_frame = t + std::max(skip, 1) - 1;
-                if (end_frame >= seq_len)
-                    end_frame = seq_len - 1;
+                if (end_frame >= T)
+                    end_frame = T - 1;
                 results[b].push_back({token_id, t, end_frame, confidence});
 
                 active_states = trie.advance(active_states, token_id);
@@ -365,10 +380,11 @@ std::vector<std::vector<int>>
 tdt_greedy_decode_boosted(ParakeetTDT &model, const Tensor &encoder_out,
                           const std::vector<int> &durations,
                           const ContextTrie &trie, float boost_score,
-                          int blank_id, int max_symbols_per_step) {
+                          int blank_id, int max_symbols_per_step,
+                          const std::vector<int> &lengths) {
     return tdt_greedy_decode_boosted(model.prediction(), model.joint(),
                                      encoder_out, durations, trie, boost_score,
-                                     blank_id, max_symbols_per_step);
+                                     blank_id, max_symbols_per_step, lengths);
 }
 
 std::vector<std::vector<TimestampedToken>>
@@ -377,20 +393,22 @@ tdt_greedy_decode_with_timestamps_boosted(ParakeetTDT &model,
                                           const std::vector<int> &durations,
                                           const ContextTrie &trie,
                                           float boost_score, int blank_id,
-                                          int max_symbols_per_step) {
+                                          int max_symbols_per_step,
+                                          const std::vector<int> &lengths) {
     return tdt_greedy_decode_with_timestamps_boosted(
         model.prediction(), model.joint(), encoder_out, durations, trie,
-        boost_score, blank_id, max_symbols_per_step);
+        boost_score, blank_id, max_symbols_per_step, lengths);
 }
 
 std::vector<std::vector<int>>
 tdt_greedy_decode_boosted(ParakeetTDTCTC &model, const Tensor &encoder_out,
                           const std::vector<int> &durations,
                           const ContextTrie &trie, float boost_score,
-                          int blank_id, int max_symbols_per_step) {
+                          int blank_id, int max_symbols_per_step,
+                          const std::vector<int> &lengths) {
     return tdt_greedy_decode_boosted(model.prediction(), model.tdt_joint(),
                                      encoder_out, durations, trie, boost_score,
-                                     blank_id, max_symbols_per_step);
+                                     blank_id, max_symbols_per_step, lengths);
 }
 
 std::vector<std::vector<TimestampedToken>>
@@ -399,10 +417,11 @@ tdt_greedy_decode_with_timestamps_boosted(ParakeetTDTCTC &model,
                                           const std::vector<int> &durations,
                                           const ContextTrie &trie,
                                           float boost_score, int blank_id,
-                                          int max_symbols_per_step) {
+                                          int max_symbols_per_step,
+                                          const std::vector<int> &lengths) {
     return tdt_greedy_decode_with_timestamps_boosted(
         model.prediction(), model.tdt_joint(), encoder_out, durations, trie,
-        boost_score, blank_id, max_symbols_per_step);
+        boost_score, blank_id, max_symbols_per_step, lengths);
 }
 
 } // namespace parakeet::decode

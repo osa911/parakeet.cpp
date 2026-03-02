@@ -69,16 +69,19 @@ class ParakeetTDT : public Module {
 // ─── TDT Greedy Decode ─────────────────────────────────────────────────────
 
 // Component-based: decode using prediction + joint directly.
+// If lengths is non-empty, use lengths[b] instead of seq_len for each element.
 std::vector<std::vector<int>>
 tdt_greedy_decode(RNNTPrediction &prediction, TDTJoint &joint,
                   const Tensor &encoder_out, const std::vector<int> &durations,
-                  int blank_id = 1024, int max_symbols_per_step = 10);
+                  int blank_id = 1024, int max_symbols_per_step = 10,
+                  const std::vector<int> &lengths = {});
 
 // Convenience: decode using a full ParakeetTDT model.
 std::vector<std::vector<int>>
 tdt_greedy_decode(ParakeetTDT &model, const Tensor &encoder_out,
                   const std::vector<int> &durations, int blank_id = 1024,
-                  int max_symbols_per_step = 10);
+                  int max_symbols_per_step = 10,
+                  const std::vector<int> &lengths = {});
 
 // ─── Timestamped TDT Greedy Decode ───────────────────────────────────────────
 
@@ -86,13 +89,12 @@ tdt_greedy_decode(ParakeetTDT &model, const Tensor &encoder_out,
 std::vector<std::vector<TimestampedToken>> tdt_greedy_decode_with_timestamps(
     RNNTPrediction &prediction, TDTJoint &joint, const Tensor &encoder_out,
     const std::vector<int> &durations, int blank_id = 1024,
-    int max_symbols_per_step = 10);
+    int max_symbols_per_step = 10, const std::vector<int> &lengths = {});
 
 // Convenience: decode with timestamps using a full ParakeetTDT model.
-std::vector<std::vector<TimestampedToken>>
-tdt_greedy_decode_with_timestamps(ParakeetTDT &model, const Tensor &encoder_out,
-                                  const std::vector<int> &durations,
-                                  int blank_id = 1024,
-                                  int max_symbols_per_step = 10);
+std::vector<std::vector<TimestampedToken>> tdt_greedy_decode_with_timestamps(
+    ParakeetTDT &model, const Tensor &encoder_out,
+    const std::vector<int> &durations, int blank_id = 1024,
+    int max_symbols_per_step = 10, const std::vector<int> &lengths = {});
 
 } // namespace parakeet::models

@@ -37,8 +37,9 @@ Tensor ParakeetCTC::forward(const Tensor &input, const Tensor &mask) const {
 
 // ─── CTC Greedy Decode ─────────────────────────────────────────────────────
 
-std::vector<std::vector<int>> ctc_greedy_decode(const Tensor &log_probs,
-                                                int blank_id) {
+std::vector<std::vector<int>>
+ctc_greedy_decode(const Tensor &log_probs, int blank_id,
+                  const std::vector<int> &lengths) {
     // log_probs: (batch, seq, vocab)
     auto lp = log_probs.to_float().ascontiguousarray();
     auto shape = lp.shape();
@@ -52,8 +53,11 @@ std::vector<std::vector<int>> ctc_greedy_decode(const Tensor &log_probs,
     for (int b = 0; b < batch_size; ++b) {
         std::vector<int> &tokens = results[b];
         int prev = -1;
+        int T = (!lengths.empty() && b < static_cast<int>(lengths.size()))
+                    ? lengths[b]
+                    : seq_len;
 
-        for (int t = 0; t < seq_len; ++t) {
+        for (int t = 0; t < T; ++t) {
             // Manual argmax along vocab dimension
             const float *frame = data + (b * seq_len + t) * vocab_size;
             int best = 0;
@@ -77,7 +81,8 @@ std::vector<std::vector<int>> ctc_greedy_decode(const Tensor &log_probs,
 // ─── Timestamped CTC Greedy Decode ────────────────────────────────────────
 
 std::vector<std::vector<TimestampedToken>>
-ctc_greedy_decode_with_timestamps(const Tensor &log_probs, int blank_id) {
+ctc_greedy_decode_with_timestamps(const Tensor &log_probs, int blank_id,
+                                  const std::vector<int> &lengths) {
     auto lp = log_probs.to_float().ascontiguousarray();
     auto shape = lp.shape();
     int batch_size = static_cast<int>(shape[0]);
@@ -91,8 +96,11 @@ ctc_greedy_decode_with_timestamps(const Tensor &log_probs, int blank_id) {
         auto &tokens = results[b];
         int prev = -1;
         int token_start_frame = 0;
+        int T = (!lengths.empty() && b < static_cast<int>(lengths.size()))
+                    ? lengths[b]
+                    : seq_len;
 
-        for (int t = 0; t < seq_len; ++t) {
+        for (int t = 0; t < T; ++t) {
             const float *frame = data + (b * seq_len + t) * vocab_size;
             int best = 0;
             float best_val = frame[0];
@@ -119,7 +127,7 @@ ctc_greedy_decode_with_timestamps(const Tensor &log_probs, int blank_id) {
 
         // Close last token span
         if (!tokens.empty()) {
-            tokens.back().end_frame = seq_len - 1;
+            tokens.back().end_frame = T - 1;
         }
     }
 
