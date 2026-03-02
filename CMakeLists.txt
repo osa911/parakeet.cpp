@@ -36,6 +36,7 @@ add_subdirectory(third_party/axiom)
 add_library(parakeet_lib
     src/audio/audio.cpp
     src/audio/audio_io.cpp
+    src/audio/vad.cpp
     src/models/encoder.cpp
     src/models/streaming_encoder.cpp
     src/models/lstm.cpp
@@ -47,6 +48,7 @@ add_library(parakeet_lib
     src/models/eou.cpp
     src/models/nemotron.cpp
     src/models/sortformer.cpp
+    src/models/silero_vad.cpp
     src/decode/timestamp.cpp
     src/decode/vocab.cpp
     src/decode/phrase_boost.cpp
