@@ -176,6 +176,47 @@ Standalone alignment is also available if you run ASR and Sortformer separately:
 auto diarized = parakeet::diarize_transcription(asr_result.word_timestamps, segments);
 ```
 
+## C API (FFI)
+
+A flat `extern "C"` API for calling parakeet.cpp from Python, Swift, Go, Rust, or any language with C FFI support.
+
+```c
+#include <parakeet/parakeet_c.h>
+
+// Create transcriber
+parakeet_transcriber_t t = parakeet_transcriber_create(
+    "model.safetensors", "vocab.txt", NULL);
+parakeet_transcriber_to_gpu(t);
+
+// Transcribe
+parakeet_result_t r = parakeet_transcriber_transcribe_file(t, "audio.wav", NULL);
+printf("%s\n", parakeet_result_text(r));
+
+// Word timestamps
+parakeet_options_t opts = parakeet_options_create();
+parakeet_options_set_timestamps(opts, 1);
+parakeet_result_t r2 = parakeet_transcriber_transcribe_file(t, "audio.wav", opts);
+for (size_t i = 0; i < parakeet_result_word_count(r2); i++) {
+    parakeet_word_timestamp_t w = parakeet_result_word_at(r2, i);
+    printf("[%.2fs-%.2fs] %s\n", w.start, w.end, w.word);
+}
+
+// Cleanup
+parakeet_result_free(r);
+parakeet_result_free(r2);
+parakeet_options_free(opts);
+parakeet_transcriber_free(t);
+```
+
+All 5 transcriber types are wrapped (`parakeet_transcriber_*`, `parakeet_tdt_transcriber_*`, `parakeet_streaming_transcriber_*`, `parakeet_nemotron_transcriber_*`, `parakeet_diarized_transcriber_*`), plus audio I/O and result accessors. Error handling uses a thread-local error string:
+
+```c
+parakeet_transcriber_t t = parakeet_transcriber_create("bad_path", "vocab.txt", NULL);
+if (!t) {
+    printf("Error: %s\n", parakeet_last_error());
+}
+```
+
 ## Low-Level API
 
 For full control over the pipeline:
@@ -528,7 +569,7 @@ Available model flags: `--110m`, `--tdt-600m`, `--rnnt-600m`, `--sortformer`. Al
 
 ### Tier 3 — Ecosystem
 
-- [ ] **C API** — Flat C interface (`parakeet_transcribe(...)`) for FFI from Python, Swift, Go, Rust.
+- [x] **C API** — Flat C interface (`parakeet_c.h`) for FFI from Python, Swift, Go, Rust. Wraps all 5 transcriber types, audio I/O, and result accessors behind opaque handles.
 - [x] **f16 inference** — Half-precision weights and compute. ~2x memory reduction. `--fp16` CLI flag, `to_half()` API, preserves axiom's lazy graph compilation.
 - [ ] **Model quantization** — INT8/INT4 weight quantization for mobile deployment.
 - [ ] **Hotword / wake word detection** — "Hey Parakeet" trigger phrase detection.
