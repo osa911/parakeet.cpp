@@ -4,7 +4,7 @@ Fast speech recognition with NVIDIA's [Parakeet](https://huggingface.co/collecti
 
 Built on [axiom](https://github.com/frikallo/axiom) — a lightweight tensor library with automatic Metal GPU acceleration. No ONNX runtime, no Python runtime, no heavyweight dependencies. Just C++ and one tensor library that outruns PyTorch MPS.
 
-**~27ms encoder inference on Apple Silicon GPU** for 10s audio (110M model) — 96x faster than CPU.
+**~27ms encoder inference on Apple Silicon GPU** for 10s audio (110M model) — 96x faster than CPU. FP16 support for ~2x memory reduction.
 
 ## Supported Models
 
@@ -25,7 +25,8 @@ All ASR models share the same audio pipeline: 16kHz mono WAV → 80-bin Mel spec
 #include <parakeet/parakeet.hpp>
 
 parakeet::Transcriber t("model.safetensors", "vocab.txt");
-t.to_gpu();  // optional — Metal acceleration
+t.to_gpu();   // optional — Metal acceleration
+t.to_half();  // optional — FP16 inference (~2x memory reduction)
 
 auto result = t.transcribe("audio.wav");
 std::cout << result.text << std::endl;
@@ -252,6 +253,14 @@ auto tokens = parakeet::ctc_greedy_decode(
 );
 ```
 
+**FP16 inference** (half-precision):
+```cpp
+model.to(axiom::DType::Float16);  // cast all weights to fp16
+model.to(axiom::Device::GPU);
+auto features_gpu = features.half().gpu();  // half() before gpu()
+auto encoder_out = model.encoder()(features_gpu);
+```
+
 ## CLI
 
 ```
@@ -274,6 +283,7 @@ Other options:
   --vocab PATH     SentencePiece vocab file
   --sortformer-weights PATH  Sortformer weights (for diarized mode)
   --gpu            Run on Metal GPU
+  --fp16           Use half-precision inference (less memory, requires --gpu)
   --timestamps     Show word-level timestamps
   --streaming      Use streaming mode (eou/nemotron models)
   --latency N      Right context frames for nemotron (0/1/6/13)
@@ -291,6 +301,9 @@ Examples:
 
 # GPU acceleration
 ./build/parakeet model.safetensors audio.wav --vocab vocab.txt --gpu
+
+# GPU + FP16 (half memory usage)
+./build/parakeet model.safetensors audio.wav --vocab vocab.txt --gpu --fp16
 
 # Word-level timestamps
 ./build/parakeet model.safetensors audio.wav --vocab vocab.txt --timestamps
@@ -516,7 +529,7 @@ Available model flags: `--110m`, `--tdt-600m`, `--rnnt-600m`, `--sortformer`. Al
 ### Tier 3 — Ecosystem
 
 - [ ] **C API** — Flat C interface (`parakeet_transcribe(...)`) for FFI from Python, Swift, Go, Rust.
-- [ ] **f16 inference** — Half-precision weights and compute. 2x memory reduction, faster on Apple Silicon.
+- [x] **f16 inference** — Half-precision weights and compute. ~2x memory reduction. `--fp16` CLI flag, `to_half()` API, preserves axiom's lazy graph compilation.
 - [ ] **Model quantization** — INT8/INT4 weight quantization for mobile deployment.
 - [ ] **Hotword / wake word detection** — "Hey Parakeet" trigger phrase detection.
 - [ ] **Speaker embedding extraction** — Speaker verification from Sortformer intermediate layers or TitaNet.
