@@ -1,6 +1,7 @@
 #include "parakeet/api/diarize.hpp"
 
 #include <algorithm>
+#include <memory>
 #include <unordered_map>
 
 namespace parakeet::api {
@@ -72,6 +73,14 @@ void DiarizedTranscriber::to_half() {
     use_fp16_ = true;
 }
 
+void DiarizedTranscriber::enable_vad(const std::string &vad_weights_path) {
+    vad_ = std::make_unique<audio::SileroVAD>(vad_weights_path);
+    if (use_fp16_)
+        vad_->to_half();
+    if (use_gpu_)
+        vad_->to_gpu();
+}
+
 DiarizedResult DiarizedTranscriber::transcribe(const std::string &audio_path,
                                                Decoder decoder) {
     auto audio_data = read_audio(audio_path);
@@ -80,15 +89,31 @@ DiarizedResult DiarizedTranscriber::transcribe(const std::string &audio_path,
 
 DiarizedResult DiarizedTranscriber::transcribe(const axiom::Tensor &samples,
                                                Decoder decoder) {
-    // 1. Run ASR with timestamps
-    auto asr_result = transcriber_.transcribe(samples, decoder,
-                                              /*timestamps=*/true);
+    // VAD preprocessing: filter audio for both ASR and Sortformer
+    axiom::Tensor audio_for_processing = samples;
+    std::unique_ptr<audio::TimestampRemapper> remapper;
+
+    if (vad_) {
+        auto vad_segments = vad_->detect(samples);
+        if (!vad_segments.empty()) {
+            audio_for_processing = audio::collect_speech(samples, vad_segments);
+            remapper = std::make_unique<audio::TimestampRemapper>(vad_segments);
+        }
+    }
+
+    // 1. Run ASR with timestamps (VAD already handled at transcriber level
+    //    if enabled, but we pass the filtered audio directly here)
+    TranscribeOptions opts;
+    opts.decoder = decoder;
+    opts.timestamps = true;
+    opts.use_vad = false; // We handle VAD at this level
+    auto asr_result = transcriber_.transcribe(audio_for_processing, opts);
 
     // 2. Run Sortformer diarization (128 mel, no normalization)
     AudioConfig sf_audio_cfg;
     sf_audio_cfg.n_mels = sf_config_.nest_encoder.mel_bins;
     sf_audio_cfg.normalize = false;
-    auto sf_features = preprocess_audio(samples, sf_audio_cfg);
+    auto sf_features = preprocess_audio(audio_for_processing, sf_audio_cfg);
     if (use_fp16_)
         sf_features = sf_features.half();
     if (use_gpu_) {
@@ -96,11 +121,24 @@ DiarizedResult DiarizedTranscriber::transcribe(const axiom::Tensor &samples,
     }
     auto segments = sortformer_.diarize(sf_features);
 
-    // 3. Fuse: assign speakers to words
+    // 3. Remap timestamps if VAD was used
+    if (remapper) {
+        asr_result.timestamped_tokens =
+            remapper->remap_tokens(asr_result.timestamped_tokens);
+        asr_result.word_timestamps =
+            remapper->remap(asr_result.word_timestamps);
+        // Remap diarization segments too
+        for (auto &seg : segments) {
+            seg.start = remapper->remap(seg.start);
+            seg.end = remapper->remap(seg.end);
+        }
+    }
+
+    // 4. Fuse: assign speakers to words
     auto diarized_words =
         diarize_transcription(asr_result.word_timestamps, segments);
 
-    // 4. Build result
+    // 5. Build result
     DiarizedResult result;
     result.text = asr_result.text;
     result.words = std::move(diarized_words);
