@@ -9,6 +9,7 @@
 #include "parakeet/api/transcribe.hpp"
 #include "parakeet/audio/audio.hpp"
 #include "parakeet/audio/audio_io.hpp"
+#include "parakeet/audio/vad.hpp"
 #include "parakeet/decode/timestamp.hpp"
 #include "parakeet/models/config.hpp"
 #include "parakeet/models/sortformer.hpp"
@@ -66,6 +67,9 @@ class DiarizedTranscriber {
     void to_gpu();
     void to_half();
 
+    /// Enable VAD preprocessing. Call after to_half()/to_gpu().
+    void enable_vad(const std::string &vad_weights_path);
+
     DiarizedResult transcribe(const std::string &audio_path,
                               Decoder decoder = Decoder::TDT);
     DiarizedResult transcribe(const axiom::Tensor &samples,
@@ -77,6 +81,7 @@ class DiarizedTranscriber {
     SortformerConfig sf_config_;
     bool use_gpu_ = false;
     bool use_fp16_ = false;
+    std::unique_ptr<audio::SileroVAD> vad_;
 };
 
 } // namespace parakeet::api

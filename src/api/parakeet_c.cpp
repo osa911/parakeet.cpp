@@ -7,6 +7,7 @@
 
 #include "parakeet/api/parakeet_c.h"
 
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -16,6 +17,7 @@
 #include "parakeet/api/diarize.hpp"
 #include "parakeet/api/transcribe.hpp"
 #include "parakeet/audio/audio_io.hpp"
+#include "parakeet/audio/vad.hpp"
 #include "parakeet/models/config.hpp"
 #include "parakeet/models/eou.hpp"
 #include "parakeet/models/nemotron.hpp"
@@ -851,6 +853,137 @@ parakeet_diarized_transcriber_transcribe_pcm(parakeet_diarized_transcriber_t t,
     r->result = t->impl->transcribe(tensor, to_cpp_decoder(decoder));
     return r;
     PARAKEET_CATCH(nullptr)
+}
+
+// ── VAD ─────────────────────────────────────────────────────────────────────
+
+struct parakeet_vad_s {
+    std::unique_ptr<parakeet::audio::SileroVAD> impl;
+};
+
+extern "C" parakeet_vad_config_t parakeet_vad_config_default(void) {
+    parakeet_vad_config_t cfg;
+    cfg.threshold = 0.5f;
+    cfg.neg_threshold = 0.35f;
+    cfg.min_speech_duration_ms = 250;
+    cfg.min_silence_duration_ms = 100;
+    cfg.speech_pad_ms = 30;
+    cfg.max_speech_duration_s = std::numeric_limits<float>::infinity();
+    return cfg;
+}
+
+extern "C" parakeet_vad_t parakeet_vad_create(const char *weights_path) {
+    if (!weights_path) {
+        g_last_error = "weights_path is null";
+        return nullptr;
+    }
+    PARAKEET_TRY
+    auto v = new parakeet_vad_s;
+    v->impl = std::make_unique<parakeet::audio::SileroVAD>(weights_path);
+    return v;
+    PARAKEET_CATCH(nullptr)
+}
+
+extern "C" void parakeet_vad_destroy(parakeet_vad_t vad) { delete vad; }
+
+extern "C" parakeet_error_t parakeet_vad_to_gpu(parakeet_vad_t vad) {
+    NULL_CHECK(vad, PARAKEET_ERROR_NULL_HANDLE);
+    PARAKEET_TRY
+    vad->impl->to_gpu();
+    return PARAKEET_OK;
+    PARAKEET_CATCH(PARAKEET_ERROR_RUNTIME)
+}
+
+extern "C" parakeet_error_t parakeet_vad_to_half(parakeet_vad_t vad) {
+    NULL_CHECK(vad, PARAKEET_ERROR_NULL_HANDLE);
+    PARAKEET_TRY
+    vad->impl->to_half();
+    return PARAKEET_OK;
+    PARAKEET_CATCH(PARAKEET_ERROR_RUNTIME)
+}
+
+extern "C" parakeet_error_t
+parakeet_vad_detect(parakeet_vad_t vad, parakeet_audio_t audio,
+                    parakeet_vad_config_t config,
+                    parakeet_speech_segment_t **segments_out, int *count_out) {
+    NULL_CHECK(vad, PARAKEET_ERROR_NULL_HANDLE);
+    NULL_CHECK(audio, PARAKEET_ERROR_NULL_HANDLE);
+    if (!segments_out || !count_out) {
+        g_last_error = "output pointers are null";
+        return PARAKEET_ERROR_INVALID_ARGUMENT;
+    }
+    PARAKEET_TRY
+    parakeet::audio::VADConfig cpp_config;
+    cpp_config.threshold = config.threshold;
+    cpp_config.neg_threshold = config.neg_threshold;
+    cpp_config.min_speech_duration_ms = config.min_speech_duration_ms;
+    cpp_config.min_silence_duration_ms = config.min_silence_duration_ms;
+    cpp_config.speech_pad_ms = config.speech_pad_ms;
+    cpp_config.max_speech_duration_s = config.max_speech_duration_s;
+
+    auto segments = vad->impl->detect(audio->audio.samples,
+                                      audio->audio.sample_rate, cpp_config);
+
+    *count_out = static_cast<int>(segments.size());
+    if (segments.empty()) {
+        *segments_out = nullptr;
+    } else {
+        auto *arr = new parakeet_speech_segment_t[segments.size()];
+        for (size_t i = 0; i < segments.size(); ++i) {
+            arr[i].start_sample = segments[i].start_sample;
+            arr[i].end_sample = segments[i].end_sample;
+        }
+        *segments_out = arr;
+    }
+    return PARAKEET_OK;
+    PARAKEET_CATCH(PARAKEET_ERROR_RUNTIME)
+}
+
+extern "C" void
+parakeet_speech_segments_free(parakeet_speech_segment_t *segments) {
+    delete[] segments;
+}
+
+extern "C" parakeet_error_t
+parakeet_transcriber_enable_vad(parakeet_transcriber_t t,
+                                const char *vad_weights_path) {
+    NULL_CHECK(t, PARAKEET_ERROR_NULL_HANDLE);
+    if (!vad_weights_path) {
+        g_last_error = "vad_weights_path is null";
+        return PARAKEET_ERROR_INVALID_ARGUMENT;
+    }
+    PARAKEET_TRY
+    t->impl->enable_vad(vad_weights_path);
+    return PARAKEET_OK;
+    PARAKEET_CATCH(PARAKEET_ERROR_RUNTIME)
+}
+
+extern "C" parakeet_error_t
+parakeet_tdt_transcriber_enable_vad(parakeet_tdt_transcriber_t t,
+                                    const char *vad_weights_path) {
+    NULL_CHECK(t, PARAKEET_ERROR_NULL_HANDLE);
+    if (!vad_weights_path) {
+        g_last_error = "vad_weights_path is null";
+        return PARAKEET_ERROR_INVALID_ARGUMENT;
+    }
+    PARAKEET_TRY
+    t->impl->enable_vad(vad_weights_path);
+    return PARAKEET_OK;
+    PARAKEET_CATCH(PARAKEET_ERROR_RUNTIME)
+}
+
+extern "C" parakeet_error_t
+parakeet_diarized_transcriber_enable_vad(parakeet_diarized_transcriber_t t,
+                                         const char *vad_weights_path) {
+    NULL_CHECK(t, PARAKEET_ERROR_NULL_HANDLE);
+    if (!vad_weights_path) {
+        g_last_error = "vad_weights_path is null";
+        return PARAKEET_ERROR_INVALID_ARGUMENT;
+    }
+    PARAKEET_TRY
+    t->impl->enable_vad(vad_weights_path);
+    return PARAKEET_OK;
+    PARAKEET_CATCH(PARAKEET_ERROR_RUNTIME)
 }
 
 // ── Result Accessors ────────────────────────────────────────────────────────
