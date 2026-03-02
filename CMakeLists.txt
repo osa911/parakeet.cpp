@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 project(Parakeet
     VERSION 0.1.0
     DESCRIPTION "Portable Parakeet Inference Engine"
-    LANGUAGES CXX
+    LANGUAGES C CXX
 )
 
 # C++20 is required
@@ -51,6 +51,7 @@ add_library(parakeet_lib
     src/sortformer.cpp
     src/diarize.cpp
     src/phrase_boost.cpp
+    src/parakeet_c.cpp
 )
 
 add_library(Parakeet::parakeet ALIAS parakeet_lib)
@@ -151,6 +152,15 @@ if(PARAKEET_BUILD_TESTS)
     add_test(NAME parakeet_tests COMMAND parakeet_tests
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     )
+
+    # C API test (pure C linkage verification)
+    add_executable(test_c_api tests/test_c_api.c)
+    target_link_libraries(test_c_api PRIVATE parakeet_lib)
+    set_target_properties(test_c_api PROPERTIES
+        C_STANDARD 99
+        LINKER_LANGUAGE CXX
+    )
+    add_test(NAME test_c_api COMMAND test_c_api)
 endif()
 
 # ── Benchmarks ───────────────────────────────────────────────────────────────
