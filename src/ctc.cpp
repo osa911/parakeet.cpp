@@ -40,7 +40,7 @@ Tensor ParakeetCTC::forward(const Tensor &input, const Tensor &mask) const {
 std::vector<std::vector<int>> ctc_greedy_decode(const Tensor &log_probs,
                                                 int blank_id) {
     // log_probs: (batch, seq, vocab)
-    auto lp = log_probs.ascontiguousarray();
+    auto lp = log_probs.to_float().ascontiguousarray();
     auto shape = lp.shape();
     int batch_size = static_cast<int>(shape[0]);
     int seq_len = static_cast<int>(shape[1]);
@@ -78,7 +78,7 @@ std::vector<std::vector<int>> ctc_greedy_decode(const Tensor &log_probs,
 
 std::vector<std::vector<TimestampedToken>>
 ctc_greedy_decode_with_timestamps(const Tensor &log_probs, int blank_id) {
-    auto lp = log_probs.ascontiguousarray();
+    auto lp = log_probs.to_float().ascontiguousarray();
     auto shape = lp.shape();
     int batch_size = static_cast<int>(shape[0]);
     int seq_len = static_cast<int>(shape[1]);

@@ -60,6 +60,7 @@ class DiarizedTranscriber {
         const SortformerConfig &sf_config = make_sortformer_117m_config());
 
     void to_gpu();
+    void to_half();
 
     DiarizedResult transcribe(const std::string &audio_path,
                               Decoder decoder = Decoder::TDT);
@@ -71,6 +72,7 @@ class DiarizedTranscriber {
     Sortformer sortformer_;
     SortformerConfig sf_config_;
     bool use_gpu_ = false;
+    bool use_fp16_ = false;
 };
 
 } // namespace parakeet

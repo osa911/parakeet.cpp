@@ -66,6 +66,12 @@ void DiarizedTranscriber::to_gpu() {
     use_gpu_ = true;
 }
 
+void DiarizedTranscriber::to_half() {
+    transcriber_.to_half();
+    sortformer_.to(axiom::DType::Float16);
+    use_fp16_ = true;
+}
+
 DiarizedResult DiarizedTranscriber::transcribe(const std::string &audio_path,
                                                Decoder decoder) {
     auto audio = read_audio(audio_path);
@@ -83,6 +89,8 @@ DiarizedResult DiarizedTranscriber::transcribe(const axiom::Tensor &samples,
     sf_audio_cfg.n_mels = sf_config_.nest_encoder.mel_bins;
     sf_audio_cfg.normalize = false;
     auto sf_features = preprocess_audio(samples, sf_audio_cfg);
+    if (use_fp16_)
+        sf_features = sf_features.half();
     if (use_gpu_) {
         sf_features = sf_features.gpu();
     }

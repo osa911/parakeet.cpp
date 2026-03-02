@@ -23,8 +23,9 @@ std::vector<int> rnnt_streaming_decode_chunk(
         size_t hs = prediction.config().pred_hidden;
         state.lstm_states.resize(num_layers);
         for (int l = 0; l < num_layers; ++l) {
-            state.lstm_states[l] = {Tensor::zeros({1, hs}),
-                                    Tensor::zeros({1, hs})};
+            state.lstm_states[l] = {
+                Tensor::zeros({1, hs}, encoder_chunk.dtype()),
+                Tensor::zeros({1, hs}, encoder_chunk.dtype())};
         }
         state.last_token = Tensor({1}, DType::Int32);
         state.last_token.fill(blank_id);
@@ -49,8 +50,11 @@ std::vector<int> rnnt_streaming_decode_chunk(
             auto [label_lp, dur_lp] = joint.forward(enc_t, pred);
 
             // Manual argmax on label log-probs for index + confidence
-            auto label_1d =
-                label_lp.squeeze(0).squeeze(0).cpu().ascontiguousarray();
+            auto label_1d = label_lp.squeeze(0)
+                                .squeeze(0)
+                                .cpu()
+                                .to_float()
+                                .ascontiguousarray();
             const float *label_data = label_1d.typed_data<float>();
             int vocab_size = static_cast<int>(label_1d.shape()[0]);
             int token_id = 0;
@@ -115,6 +119,8 @@ std::string StreamingTranscriber::transcribe_chunk(const Tensor &samples) {
         return ""; // not enough samples yet
     }
 
+    if (use_fp16_)
+        features = features.half();
     if (use_gpu_) {
         features = features.gpu();
     }

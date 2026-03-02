@@ -27,6 +27,8 @@ std::string NemotronTranscriber::transcribe_chunk(const Tensor &samples) {
         return "";
     }
 
+    if (use_fp16_)
+        features = features.half();
     if (use_gpu_) {
         features = features.gpu();
     }

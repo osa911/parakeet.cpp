@@ -53,8 +53,8 @@ Tensor CausalConformerConvModule::forward_cached(const Tensor &input,
     } else {
         // First chunk: zero-pad left
         auto shape = x.shape();
-        auto pad_tensor =
-            Tensor::zeros({shape[0], shape[1], static_cast<size_t>(cache_len)});
+        auto pad_tensor = Tensor::zeros(
+            {shape[0], shape[1], static_cast<size_t>(cache_len)}, x.dtype());
         if (x.device() != axiom::Device::CPU)
             pad_tensor = pad_tensor.to(x.device());
         x = Tensor::cat({pad_tensor, x}, 2);
@@ -410,6 +410,9 @@ Tensor StreamingFastConformerEncoder::forward(const Tensor &input,
     int d_model = static_cast<int>(x.shape()[2]);
     auto pos_emb = sinusoidal_position_embedding(seq_len, d_model);
 
+    if (x.dtype() != pos_emb.dtype()) {
+        pos_emb = pos_emb.astype(x.dtype());
+    }
     if (x.device() != pos_emb.device()) {
         pos_emb = pos_emb.to(x.device());
     }
@@ -454,6 +457,9 @@ Tensor StreamingFastConformerEncoder::forward_chunk(const Tensor &input,
     // For streaming, we need positions relative to the current chunk + cache
     int total_context = config_.att_context_left + chunk_len;
     auto pos_emb = sinusoidal_position_embedding(total_context, d_model);
+    if (x.dtype() != pos_emb.dtype()) {
+        pos_emb = pos_emb.astype(x.dtype());
+    }
     if (x.device() != pos_emb.device()) {
         pos_emb = pos_emb.to(x.device());
     }
