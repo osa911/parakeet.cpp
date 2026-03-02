@@ -54,9 +54,9 @@ class ArpaLM {
   private:
     struct TrieNode {
         std::unordered_map<int, int> children; // word_id -> child node index
-        float log_prob = -99.0f;  // log10 probability at this node
-        float backoff = 0.0f;     // backoff weight (log10)
-        bool has_entry = false;   // whether this node has an explicit n-gram
+        float log_prob = -99.0f;               // log10 probability at this node
+        float backoff = 0.0f;                  // backoff weight (log10)
+        bool has_entry = false; // whether this node has an explicit n-gram
     };
 
     std::vector<TrieNode> nodes_;
