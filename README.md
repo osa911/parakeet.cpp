@@ -181,7 +181,7 @@ auto diarized = parakeet::diarize_transcription(asr_result.word_timestamps, segm
 A flat `extern "C"` API for calling parakeet.cpp from Python, Swift, Go, Rust, or any language with C FFI support.
 
 ```c
-#include <parakeet/parakeet_c.h>
+#include <parakeet/api/parakeet_c.h>
 
 // Create transcriber
 parakeet_transcriber_t t = parakeet_transcriber_create(

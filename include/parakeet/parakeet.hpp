@@ -1,23 +1,38 @@
 #pragma once
 
-// Umbrella header — includes all parakeet model types
+// Umbrella header — includes all parakeet modules
 
-#include "parakeet/audio.hpp"
-#include "parakeet/audio_io.hpp"
-#include "parakeet/config.hpp"
-#include "parakeet/ctc.hpp"
-#include "parakeet/diarize.hpp"
-#include "parakeet/encoder.hpp"
-#include "parakeet/eou.hpp"
-#include "parakeet/lstm.hpp"
-#include "parakeet/nemotron.hpp"
-#include "parakeet/phrase_boost.hpp"
-#include "parakeet/rnnt.hpp"
-#include "parakeet/sortformer.hpp"
-#include "parakeet/streaming_encoder.hpp"
-#include "parakeet/tdt.hpp"
-#include "parakeet/tdt_ctc.hpp"
-#include "parakeet/timestamp.hpp"
-#include "parakeet/transcribe.hpp"
-#include "parakeet/transformer.hpp"
-#include "parakeet/vocab.hpp"
+// Audio
+#include "parakeet/audio/audio.hpp"
+#include "parakeet/audio/audio_io.hpp"
+
+// Models
+#include "parakeet/models/config.hpp"
+#include "parakeet/models/ctc.hpp"
+#include "parakeet/models/encoder.hpp"
+#include "parakeet/models/eou.hpp"
+#include "parakeet/models/lstm.hpp"
+#include "parakeet/models/nemotron.hpp"
+#include "parakeet/models/rnnt.hpp"
+#include "parakeet/models/sortformer.hpp"
+#include "parakeet/models/streaming_encoder.hpp"
+#include "parakeet/models/tdt.hpp"
+#include "parakeet/models/tdt_ctc.hpp"
+#include "parakeet/models/transformer.hpp"
+
+// Decode
+#include "parakeet/decode/phrase_boost.hpp"
+#include "parakeet/decode/timestamp.hpp"
+#include "parakeet/decode/vocab.hpp"
+
+// API
+#include "parakeet/api/diarize.hpp"
+#include "parakeet/api/transcribe.hpp"
+
+// Backward compatibility: re-export sub-namespaces into parakeet::
+namespace parakeet {
+using namespace audio;
+using namespace models;
+using namespace decode;
+using namespace api;
+} // namespace parakeet
