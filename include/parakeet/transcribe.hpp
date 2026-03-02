@@ -70,6 +70,12 @@ class Transcriber {
         use_gpu_ = true;
     }
 
+    /// Cast model to fp16. Call before to_gpu() for efficient transfer.
+    void to_half() {
+        model_.to(axiom::DType::Float16);
+        use_fp16_ = true;
+    }
+
     /// Transcribe an audio file (WAV, FLAC, MP3, OGG).
     TranscribeResult transcribe(const std::string &audio_path,
                                 Decoder decoder = Decoder::TDT,
@@ -101,6 +107,8 @@ class Transcriber {
         AudioConfig audio_cfg;
         audio_cfg.n_mels = config_.encoder.mel_bins;
         auto features = preprocess_audio(samples, audio_cfg);
+        if (use_fp16_)
+            features = features.half();
         if (use_gpu_) {
             features = features.gpu();
         }
@@ -187,6 +195,7 @@ class Transcriber {
     ParakeetTDTCTC model_;
     Tokenizer tokenizer_;
     bool use_gpu_ = false;
+    bool use_fp16_ = false;
 };
 
 // ─── TDT-Only Transcriber (for 600M multilingual etc.) ─────────────────────
@@ -211,6 +220,11 @@ class TDTTranscriber {
     void to_gpu() {
         model_.to(axiom::Device::GPU);
         use_gpu_ = true;
+    }
+
+    void to_half() {
+        model_.to(axiom::DType::Float16);
+        use_fp16_ = true;
     }
 
     TranscribeResult transcribe(const std::string &audio_path,
@@ -238,6 +252,8 @@ class TDTTranscriber {
         AudioConfig audio_cfg;
         audio_cfg.n_mels = config_.encoder.mel_bins;
         auto features = preprocess_audio(samples, audio_cfg);
+        if (use_fp16_)
+            features = features.half();
         if (use_gpu_) {
             features = features.gpu();
         }
@@ -296,6 +312,7 @@ class TDTTranscriber {
     ParakeetTDT model_;
     Tokenizer tokenizer_;
     bool use_gpu_ = false;
+    bool use_fp16_ = false;
 };
 
 } // namespace parakeet

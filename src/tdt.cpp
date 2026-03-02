@@ -50,7 +50,8 @@ tdt_greedy_decode(RNNTPrediction &prediction, TDTJoint &joint,
         size_t hs = prediction.config().pred_hidden;
         std::vector<LSTMState> states(num_layers);
         for (int l = 0; l < num_layers; ++l) {
-            states[l] = {Tensor::zeros({1, hs}), Tensor::zeros({1, hs})};
+            states[l] = {Tensor::zeros({1, hs}, encoder_out.dtype()),
+                         Tensor::zeros({1, hs}, encoder_out.dtype())};
         }
 
         // Start with blank token (SOS) — blank embedding is all zeros,
@@ -135,7 +136,8 @@ std::vector<std::vector<TimestampedToken>> tdt_greedy_decode_with_timestamps(
         size_t hs = prediction.config().pred_hidden;
         std::vector<LSTMState> states(num_layers);
         for (int l = 0; l < num_layers; ++l) {
-            states[l] = {Tensor::zeros({1, hs}), Tensor::zeros({1, hs})};
+            states[l] = {Tensor::zeros({1, hs}, encoder_out.dtype()),
+                         Tensor::zeros({1, hs}, encoder_out.dtype())};
         }
 
         auto token = Tensor({1}, DType::Int32);
@@ -154,8 +156,11 @@ std::vector<std::vector<TimestampedToken>> tdt_greedy_decode_with_timestamps(
                 auto [label_lp, dur_lp] = joint.forward(enc_t, pred);
 
                 // Manual argmax on label log-probs to get both index and value
-                auto label_1d =
-                    label_lp.squeeze(0).squeeze(0).cpu().ascontiguousarray();
+                auto label_1d = label_lp.squeeze(0)
+                                    .squeeze(0)
+                                    .cpu()
+                                    .to_float()
+                                    .ascontiguousarray();
                 const float *label_data = label_1d.typed_data<float>();
                 int vocab_size = static_cast<int>(label_1d.shape()[0]);
                 int token_id = 0;
