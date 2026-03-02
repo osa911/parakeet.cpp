@@ -36,7 +36,8 @@ ParakeetTDT::ParakeetTDT(const TDTConfig &config)
 std::vector<std::vector<int>>
 tdt_greedy_decode(RNNTPrediction &prediction, TDTJoint &joint,
                   const Tensor &encoder_out, const std::vector<int> &durations,
-                  int blank_id, int max_symbols_per_step) {
+                  int blank_id, int max_symbols_per_step,
+                  const std::vector<int> &lengths) {
     auto shape = encoder_out.shape();
     int batch_size = static_cast<int>(shape[0]);
     int seq_len = static_cast<int>(shape[1]);
@@ -45,6 +46,9 @@ tdt_greedy_decode(RNNTPrediction &prediction, TDTJoint &joint,
 
     for (int b = 0; b < batch_size; ++b) {
         auto enc = encoder_out.slice({Slice(b, b + 1)}); // (1, seq, hidden)
+        int T = (!lengths.empty() && b < static_cast<int>(lengths.size()))
+                    ? lengths[b]
+                    : seq_len;
 
         int num_layers = prediction.config().num_lstm_layers;
         size_t hs = prediction.config().pred_hidden;
@@ -60,7 +64,7 @@ tdt_greedy_decode(RNNTPrediction &prediction, TDTJoint &joint,
         token.fill(blank_id);
         int t = 0;
 
-        while (t < seq_len) {
+        while (t < T) {
             auto enc_t =
                 enc.slice({Slice(), Slice(t, t + 1)}); // (1, 1, hidden)
 
@@ -113,16 +117,18 @@ tdt_greedy_decode(RNNTPrediction &prediction, TDTJoint &joint,
 std::vector<std::vector<int>>
 tdt_greedy_decode(ParakeetTDT &model, const Tensor &encoder_out,
                   const std::vector<int> &durations, int blank_id,
-                  int max_symbols_per_step) {
+                  int max_symbols_per_step, const std::vector<int> &lengths) {
     return tdt_greedy_decode(model.prediction(), model.joint(), encoder_out,
-                             durations, blank_id, max_symbols_per_step);
+                             durations, blank_id, max_symbols_per_step,
+                             lengths);
 }
 
 // ─── Timestamped TDT Greedy Decode ────────────────────────────────────────
 
 std::vector<std::vector<TimestampedToken>> tdt_greedy_decode_with_timestamps(
     RNNTPrediction &prediction, TDTJoint &joint, const Tensor &encoder_out,
-    const std::vector<int> &durations, int blank_id, int max_symbols_per_step) {
+    const std::vector<int> &durations, int blank_id, int max_symbols_per_step,
+    const std::vector<int> &lengths) {
     auto shape = encoder_out.shape();
     int batch_size = static_cast<int>(shape[0]);
     int seq_len = static_cast<int>(shape[1]);
@@ -131,6 +137,9 @@ std::vector<std::vector<TimestampedToken>> tdt_greedy_decode_with_timestamps(
 
     for (int b = 0; b < batch_size; ++b) {
         auto enc = encoder_out.slice({Slice(b, b + 1)});
+        int T = (!lengths.empty() && b < static_cast<int>(lengths.size()))
+                    ? lengths[b]
+                    : seq_len;
 
         int num_layers = prediction.config().num_lstm_layers;
         size_t hs = prediction.config().pred_hidden;
@@ -144,7 +153,7 @@ std::vector<std::vector<TimestampedToken>> tdt_greedy_decode_with_timestamps(
         token.fill(blank_id);
         int t = 0;
 
-        while (t < seq_len) {
+        while (t < T) {
             auto enc_t = enc.slice({Slice(), Slice(t, t + 1)});
 
             for (int sym = 0; sym < max_symbols_per_step; ++sym) {
@@ -187,8 +196,8 @@ std::vector<std::vector<TimestampedToken>> tdt_greedy_decode_with_timestamps(
 
                 // Record token with start=t, end=t+duration
                 int end_frame = t + std::max(skip, 1) - 1;
-                if (end_frame >= seq_len)
-                    end_frame = seq_len - 1;
+                if (end_frame >= T)
+                    end_frame = T - 1;
                 results[b].push_back({token_id, t, end_frame, confidence});
 
                 token = Tensor({1}, DType::Int32);
@@ -208,10 +217,11 @@ std::vector<std::vector<TimestampedToken>> tdt_greedy_decode_with_timestamps(
 std::vector<std::vector<TimestampedToken>>
 tdt_greedy_decode_with_timestamps(ParakeetTDT &model, const Tensor &encoder_out,
                                   const std::vector<int> &durations,
-                                  int blank_id, int max_symbols_per_step) {
+                                  int blank_id, int max_symbols_per_step,
+                                  const std::vector<int> &lengths) {
     return tdt_greedy_decode_with_timestamps(model.prediction(), model.joint(),
                                              encoder_out, durations, blank_id,
-                                             max_symbols_per_step);
+                                             max_symbols_per_step, lengths);
 }
 
 } // namespace parakeet::models

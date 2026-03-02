@@ -30,6 +30,30 @@ struct AudioData; // forward declaration
 axiom::Tensor preprocess_audio(const AudioData &audio,
                                const AudioConfig &config = {});
 
+// ─── Batch Preprocessing ────────────────────────────────────────────────────
+
+// Compute encoder output length after ConvSubsampling (3x stride-2 convs).
+// Formula per stage: floor((L - 1) / 2) + 1, applied 3 times.
+int compute_subsampled_length(int feature_length);
+
+struct BatchFeatures {
+    axiom::Tensor features;           // (batch, max_frames, n_mels) padded
+    std::vector<int> feature_lengths; // per-element frame count before padding
+};
+
+// Preprocess multiple waveforms, pad to equal length, and concatenate.
+// Returns (batch, max_frames, n_mels) tensor and per-element frame counts.
+BatchFeatures
+preprocess_audio_batch(const std::vector<axiom::Tensor> &waveforms,
+                       const AudioConfig &config = {});
+
+// Create attention mask for batched encoder.
+// Returns (batch, 1, max_len, max_len) where mask[b,0,i,j]=1.0 if j >=
+// subsampled_lengths[b] (padded position). Broadcasts to (batch, heads, seq,
+// seq).
+axiom::Tensor create_padding_mask(const std::vector<int> &subsampled_lengths,
+                                  int max_len);
+
 // ─── Streaming Audio Preprocessor ────────────────────────────────────────────
 
 // Maintains preemphasis state and STFT overlap buffer for chunk-wise

@@ -426,6 +426,33 @@ parakeet_transcriber_transcribe_pcm(parakeet_transcriber_t t,
     PARAKEET_CATCH(nullptr)
 }
 
+extern "C" parakeet_result_t *
+parakeet_transcriber_transcribe_batch(parakeet_transcriber_t t,
+                                      const char **paths, size_t count,
+                                      parakeet_options_t opts) {
+    if (!t || !paths || count == 0) {
+        g_last_error = !t ? "null transcriber handle" : "invalid paths/count";
+        return nullptr;
+    }
+    PARAKEET_TRY
+    std::vector<std::string> path_vec;
+    path_vec.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        if (!paths[i]) {
+            g_last_error = "null path at index " + std::to_string(i);
+            return nullptr;
+        }
+        path_vec.emplace_back(paths[i]);
+    }
+    auto results = t->impl->transcribe_batch(path_vec, resolve_opts(opts));
+    auto *arr = new parakeet_result_t[count];
+    for (size_t i = 0; i < results.size(); ++i) {
+        arr[i] = new parakeet_result_s{std::move(results[i])};
+    }
+    return arr;
+    PARAKEET_CATCH(nullptr)
+}
+
 // ── TDT Transcriber (600M) ─────────────────────────────────────────────────
 
 extern "C" parakeet_tdt_transcriber_t
@@ -500,6 +527,33 @@ parakeet_tdt_transcriber_transcribe_pcm(parakeet_tdt_transcriber_t t,
     auto r = new parakeet_result_s;
     r->result = t->impl->transcribe(tensor, resolve_opts(opts));
     return r;
+    PARAKEET_CATCH(nullptr)
+}
+
+extern "C" parakeet_result_t *
+parakeet_tdt_transcriber_transcribe_batch(parakeet_tdt_transcriber_t t,
+                                          const char **paths, size_t count,
+                                          parakeet_options_t opts) {
+    if (!t || !paths || count == 0) {
+        g_last_error = !t ? "null transcriber handle" : "invalid paths/count";
+        return nullptr;
+    }
+    PARAKEET_TRY
+    std::vector<std::string> path_vec;
+    path_vec.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        if (!paths[i]) {
+            g_last_error = "null path at index " + std::to_string(i);
+            return nullptr;
+        }
+        path_vec.emplace_back(paths[i]);
+    }
+    auto results = t->impl->transcribe_batch(path_vec, resolve_opts(opts));
+    auto *arr = new parakeet_result_t[count];
+    for (size_t i = 0; i < results.size(); ++i) {
+        arr[i] = new parakeet_result_s{std::move(results[i])};
+    }
+    return arr;
     PARAKEET_CATCH(nullptr)
 }
 
@@ -800,6 +854,16 @@ parakeet_diarized_transcriber_transcribe_pcm(parakeet_diarized_transcriber_t t,
 }
 
 // ── Result Accessors ────────────────────────────────────────────────────────
+
+extern "C" void parakeet_result_batch_free(parakeet_result_t *results,
+                                           size_t count) {
+    if (!results)
+        return;
+    for (size_t i = 0; i < count; ++i) {
+        delete results[i];
+    }
+    delete[] results;
+}
 
 extern "C" void parakeet_result_free(parakeet_result_t r) { delete r; }
 

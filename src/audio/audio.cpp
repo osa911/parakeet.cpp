@@ -166,6 +166,84 @@ Tensor preprocess_audio(const AudioData &audio, const AudioConfig &config) {
     return preprocess_audio(audio.samples, config);
 }
 
+// ─── Batch Preprocessing ─────────────────────────────────────────────────────
+
+int compute_subsampled_length(int feature_length) {
+    int L = feature_length;
+    // 3 conv layers with kernel=3, stride=2, padding=1
+    for (int i = 0; i < 3; ++i) {
+        L = (L - 1) / 2 + 1;
+    }
+    return L;
+}
+
+BatchFeatures preprocess_audio_batch(const std::vector<Tensor> &waveforms,
+                                     const AudioConfig &config) {
+    if (waveforms.empty()) {
+        return {Tensor(), {}};
+    }
+
+    // Preprocess each waveform individually
+    std::vector<Tensor> features_list;
+    std::vector<int> feature_lengths;
+    features_list.reserve(waveforms.size());
+    feature_lengths.reserve(waveforms.size());
+
+    int max_frames = 0;
+    int n_mels = 0;
+    for (const auto &waveform : waveforms) {
+        auto feat = preprocess_audio(waveform, config); // (1, frames, n_mels)
+        int frames = static_cast<int>(feat.shape()[1]);
+        n_mels = static_cast<int>(feat.shape()[2]);
+        feature_lengths.push_back(frames);
+        if (frames > max_frames)
+            max_frames = frames;
+        features_list.push_back(feat);
+    }
+
+    // Pad shorter sequences and concatenate
+    std::vector<Tensor> padded;
+    padded.reserve(features_list.size());
+    for (size_t i = 0; i < features_list.size(); ++i) {
+        int frames = feature_lengths[i];
+        if (frames < max_frames) {
+            // Pad with zeros along time dimension
+            auto pad_tensor =
+                Tensor::zeros({1, static_cast<size_t>(max_frames - frames),
+                               static_cast<size_t>(n_mels)});
+            padded.push_back(
+                Tensor::cat({features_list[i], pad_tensor}, /*axis=*/1));
+        } else {
+            padded.push_back(features_list[i]);
+        }
+    }
+
+    // Concatenate along batch dimension
+    auto batched = Tensor::cat(padded, /*axis=*/0);
+    return {batched, feature_lengths};
+}
+
+Tensor create_padding_mask(const std::vector<int> &subsampled_lengths,
+                           int max_len) {
+    int batch_size = static_cast<int>(subsampled_lengths.size());
+    // (batch, 1, max_len, max_len)
+    size_t B = static_cast<size_t>(batch_size);
+    size_t S = static_cast<size_t>(max_len);
+    std::vector<float> mask_data(B * 1 * S * S, 0.0f);
+
+    for (int b = 0; b < batch_size; ++b) {
+        int valid_len = subsampled_lengths[b];
+        for (int i = 0; i < max_len; ++i) {
+            for (int j = valid_len; j < max_len; ++j) {
+                // Mark padded positions
+                mask_data[b * S * S + i * S + j] = 1.0f;
+            }
+        }
+    }
+
+    return Tensor::from_data(mask_data.data(), Shape{B, 1, S, S}, true);
+}
+
 // ─── Streaming Audio Preprocessor ────────────────────────────────────────────
 
 StreamingAudioPreprocessor::StreamingAudioPreprocessor(

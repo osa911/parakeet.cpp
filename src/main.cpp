@@ -11,7 +11,8 @@
 
 static void print_usage(const char *prog) {
     std::cerr
-        << "Usage: " << prog << " <model.safetensors> <audio.wav> [options]\n"
+        << "Usage: " << prog
+        << " <model.safetensors> <audio.wav> [audio2.wav ...] [options]\n"
         << "\nModel types:\n"
         << "  --model TYPE   Model type (default: tdt-ctc-110m)\n"
         << "                 Types: tdt-ctc-110m, tdt-600m, rnnt-600m,\n"
@@ -33,6 +34,9 @@ static void print_usage(const char *prog) {
         << "  --timestamps   Show word-level timestamps\n"
         << "  --streaming    Use streaming mode (eou/nemotron models)\n"
         << "  --latency N    Right context frames for nemotron (0/1/6/13)\n"
+        << "\nBatch mode:\n"
+        << "  Multiple audio files can be specified for batch inference.\n"
+        << "  Supported for tdt-ctc-110m and tdt-600m models.\n"
         << std::endl;
 }
 
@@ -201,6 +205,59 @@ static int run_tdt_ctc_110m(const std::string &weights_path,
     return 0;
 }
 
+// ─── TDT-CTC 110M batch mode ────────────────────────────────────────────────
+
+static int
+run_tdt_ctc_110m_batch(const std::string &weights_path,
+                       const std::vector<std::string> &audio_paths,
+                       const std::string &vocab_path, bool use_ctc,
+                       bool use_gpu, bool use_fp16, bool show_timestamps,
+                       const std::vector<std::string> &boost_phrases = {},
+                       float boost_score = 5.0f) {
+    using namespace parakeet;
+    using Clock = std::chrono::high_resolution_clock;
+
+    std::cout << "Loading model: tdt-ctc-110m (batch mode, "
+              << audio_paths.size() << " files)" << std::endl;
+    Transcriber transcriber(weights_path, vocab_path);
+    if (use_fp16)
+        transcriber.to_half();
+    if (use_gpu)
+        transcriber.to_gpu();
+
+    TranscribeOptions opts;
+    opts.decoder = use_ctc ? Decoder::CTC : Decoder::TDT;
+    opts.timestamps = show_timestamps;
+    opts.boost_phrases = boost_phrases;
+    opts.boost_score = boost_score;
+
+    auto t0 = Clock::now();
+    auto results = transcriber.transcribe_batch(audio_paths, opts);
+    auto t1 = Clock::now();
+
+    auto total_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+    std::cout << "Batch transcription: " << total_ms << " ms ("
+              << audio_paths.size() << " files)" << std::endl;
+
+    for (size_t i = 0; i < results.size(); ++i) {
+        std::cout << "\n--- [" << (i + 1) << "/" << results.size() << "] "
+                  << audio_paths[i] << " (" << results[i].token_ids.size()
+                  << " tokens) ---" << std::endl;
+        std::cout << results[i].text << std::endl;
+
+        if (show_timestamps && !results[i].word_timestamps.empty()) {
+            std::cout << "\n--- Word Timestamps ---" << std::endl;
+            for (const auto &w : results[i].word_timestamps) {
+                std::cout << "  [" << std::fixed << std::setprecision(2)
+                          << w.start << "s - " << w.end << "s] ("
+                          << w.confidence << ") " << w.word << std::endl;
+            }
+        }
+    }
+    return 0;
+}
+
 // ─── TDT 600M mode ──────────────────────────────────────────────────────────
 
 static int run_tdt_600m(const std::string &weights_path,
@@ -297,6 +354,59 @@ static int run_tdt_600m(const std::string &weights_path,
                 group_timestamps(timestamped_tokens[b], tokenizer.pieces());
             std::cout << "\n--- Word Timestamps ---" << std::endl;
             for (const auto &w : words) {
+                std::cout << "  [" << std::fixed << std::setprecision(2)
+                          << w.start << "s - " << w.end << "s] ("
+                          << w.confidence << ") " << w.word << std::endl;
+            }
+        }
+    }
+    return 0;
+}
+
+// ─── TDT 600M batch mode ────────────────────────────────────────────────────
+
+static int
+run_tdt_600m_batch(const std::string &weights_path,
+                   const std::vector<std::string> &audio_paths,
+                   const std::string &vocab_path, bool use_gpu, bool use_fp16,
+                   bool show_timestamps,
+                   const std::vector<std::string> &boost_phrases = {},
+                   float boost_score = 5.0f) {
+    using namespace parakeet;
+    using Clock = std::chrono::high_resolution_clock;
+
+    std::cout << "Loading model: tdt-600m (batch mode, " << audio_paths.size()
+              << " files)" << std::endl;
+    TDTTranscriber transcriber(weights_path, vocab_path);
+    if (use_fp16)
+        transcriber.to_half();
+    if (use_gpu)
+        transcriber.to_gpu();
+
+    TranscribeOptions opts;
+    opts.decoder = Decoder::TDT;
+    opts.timestamps = show_timestamps;
+    opts.boost_phrases = boost_phrases;
+    opts.boost_score = boost_score;
+
+    auto t0 = Clock::now();
+    auto results = transcriber.transcribe_batch(audio_paths, opts);
+    auto t1 = Clock::now();
+
+    auto total_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+    std::cout << "Batch transcription: " << total_ms << " ms ("
+              << audio_paths.size() << " files)" << std::endl;
+
+    for (size_t i = 0; i < results.size(); ++i) {
+        std::cout << "\n--- [" << (i + 1) << "/" << results.size() << "] "
+                  << audio_paths[i] << " (" << results[i].token_ids.size()
+                  << " tokens) ---" << std::endl;
+        std::cout << results[i].text << std::endl;
+
+        if (show_timestamps && !results[i].word_timestamps.empty()) {
+            std::cout << "\n--- Word Timestamps ---" << std::endl;
+            for (const auto &w : results[i].word_timestamps) {
                 std::cout << "  [" << std::fixed << std::setprecision(2)
                           << w.start << "s - " << w.end << "s] ("
                           << w.confidence << ") " << w.word << std::endl;
@@ -687,7 +797,6 @@ int main(int argc, char *argv[]) {
 
     try {
         std::string weights_path = argv[1];
-        std::string audio_path = argv[2];
         std::string model_type = "tdt-ctc-110m";
         bool use_ctc = false;
         bool use_gpu = false;
@@ -700,8 +809,9 @@ int main(int argc, char *argv[]) {
         std::string sortformer_weights_path;
         std::vector<std::string> boost_phrases;
         float boost_score = 5.0f;
+        std::vector<std::string> audio_paths;
 
-        for (int i = 3; i < argc; ++i) {
+        for (int i = 2; i < argc; ++i) {
             std::string arg = argv[i];
             if (arg == "--model" && i + 1 < argc) {
                 model_type = argv[++i];
@@ -729,11 +839,20 @@ int main(int argc, char *argv[]) {
                 boost_phrases.push_back(argv[++i]);
             } else if (arg == "--boost-score" && i + 1 < argc) {
                 boost_score = std::stof(argv[++i]);
-            } else {
+            } else if (arg.substr(0, 2) == "--") {
                 std::cerr << "Unknown option: " << arg << std::endl;
                 print_usage(argv[0]);
                 return 1;
+            } else {
+                // Positional argument = audio file
+                audio_paths.push_back(arg);
             }
+        }
+
+        if (audio_paths.empty()) {
+            std::cerr << "Error: at least one audio file required" << std::endl;
+            print_usage(argv[0]);
+            return 1;
         }
 
         if (use_gpu && !axiom::system::is_metal_available()) {
@@ -741,11 +860,24 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
+        std::string audio_path =
+            audio_paths[0]; // first audio for single-file modes
+
         if (model_type == "tdt-ctc-110m") {
+            if (audio_paths.size() > 1) {
+                return run_tdt_ctc_110m_batch(
+                    weights_path, audio_paths, vocab_path, use_ctc, use_gpu,
+                    use_fp16, show_timestamps, boost_phrases, boost_score);
+            }
             return run_tdt_ctc_110m(
                 weights_path, audio_path, vocab_path, features_path, use_ctc,
                 use_gpu, use_fp16, show_timestamps, boost_phrases, boost_score);
         } else if (model_type == "tdt-600m") {
+            if (audio_paths.size() > 1) {
+                return run_tdt_600m_batch(weights_path, audio_paths, vocab_path,
+                                          use_gpu, use_fp16, show_timestamps,
+                                          boost_phrases, boost_score);
+            }
             return run_tdt_600m(weights_path, audio_path, vocab_path, use_gpu,
                                 use_fp16, show_timestamps, boost_phrases,
                                 boost_score);
