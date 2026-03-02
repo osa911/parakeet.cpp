@@ -169,6 +169,12 @@ parakeet_result_t parakeet_transcriber_transcribe_pcm(
     parakeet_transcriber_t t, const float *samples, size_t n,
     parakeet_options_t opts);
 
+/** Batch transcribe multiple audio files. Returns array of count results.
+ *  Free with parakeet_result_batch_free(). Returns NULL on failure. */
+parakeet_result_t *parakeet_transcriber_transcribe_batch(
+    parakeet_transcriber_t t, const char **paths, size_t count,
+    parakeet_options_t opts);
+
 /* ── TDT Transcriber (600M) ─────────────────────────────────────────────── */
 
 /** Create a 600M TDT transcriber. config may be NULL for default. */
@@ -181,6 +187,12 @@ parakeet_result_t parakeet_tdt_transcriber_transcribe_file(
     parakeet_tdt_transcriber_t t, const char *path, parakeet_options_t opts);
 parakeet_result_t parakeet_tdt_transcriber_transcribe_pcm(
     parakeet_tdt_transcriber_t t, const float *samples, size_t n,
+    parakeet_options_t opts);
+
+/** Batch transcribe multiple audio files. Returns array of count results.
+ *  Free with parakeet_result_batch_free(). Returns NULL on failure. */
+parakeet_result_t *parakeet_tdt_transcriber_transcribe_batch(
+    parakeet_tdt_transcriber_t t, const char **paths, size_t count,
     parakeet_options_t opts);
 
 /* ── Streaming Transcriber (EOU 120M) ────────────────────────────────────── */
@@ -262,6 +274,9 @@ parakeet_diarized_result_t parakeet_diarized_transcriber_transcribe_pcm(
     parakeet_decoder_t decoder);
 
 /* ── Result Accessors ────────────────────────────────────────────────────── */
+
+/** Free a batch of results returned by transcribe_batch. */
+void        parakeet_result_batch_free(parakeet_result_t *results, size_t count);
 
 void        parakeet_result_free(parakeet_result_t r);
 const char *parakeet_result_text(parakeet_result_t r);

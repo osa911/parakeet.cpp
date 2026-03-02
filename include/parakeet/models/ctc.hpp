@@ -53,11 +53,14 @@ class ParakeetCTC : public Module {
 
 // Takes (batch, seq, vocab_size) log probs, returns per-batch token sequences.
 // Applies argmax, collapses repeats, removes blank (token 0).
-std::vector<std::vector<int>> ctc_greedy_decode(const Tensor &log_probs,
-                                                int blank_id = 1024);
+// If lengths is non-empty, only decode frames 0..lengths[b]-1 for each element.
+std::vector<std::vector<int>>
+ctc_greedy_decode(const Tensor &log_probs, int blank_id = 1024,
+                  const std::vector<int> &lengths = {});
 
 // Same as above, but records frame indices for each emitted token.
 std::vector<std::vector<TimestampedToken>>
-ctc_greedy_decode_with_timestamps(const Tensor &log_probs, int blank_id = 1024);
+ctc_greedy_decode_with_timestamps(const Tensor &log_probs, int blank_id = 1024,
+                                  const std::vector<int> &lengths = {});
 
 } // namespace parakeet::models

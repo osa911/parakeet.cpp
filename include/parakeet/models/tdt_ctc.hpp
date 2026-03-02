@@ -51,12 +51,13 @@ class ParakeetTDTCTC : public Module {
 std::vector<std::vector<int>>
 tdt_greedy_decode(ParakeetTDTCTC &model, const Tensor &encoder_out,
                   const std::vector<int> &durations, int blank_id = 1024,
-                  int max_symbols_per_step = 10);
+                  int max_symbols_per_step = 10,
+                  const std::vector<int> &lengths = {});
 
 // Timestamped TDT greedy decode using the TDT head of a ParakeetTDTCTC model.
 std::vector<std::vector<TimestampedToken>> tdt_greedy_decode_with_timestamps(
     ParakeetTDTCTC &model, const Tensor &encoder_out,
     const std::vector<int> &durations, int blank_id = 1024,
-    int max_symbols_per_step = 10);
+    int max_symbols_per_step = 10, const std::vector<int> &lengths = {});
 
 } // namespace parakeet::models
