@@ -8,6 +8,7 @@
 
 #include "parakeet/audio/audio.hpp"
 #include "parakeet/audio/audio_io.hpp"
+#include "parakeet/audio/vad.hpp"
 #include "parakeet/decode/phrase_boost.hpp"
 #include "parakeet/decode/timestamp.hpp"
 #include "parakeet/decode/vocab.hpp"
@@ -46,6 +47,7 @@ struct TranscribeOptions {
     bool timestamps = false;
     std::vector<std::string> boost_phrases;
     float boost_score = 5.0f;
+    bool use_vad = false; // Enable Silero VAD preprocessing
 };
 
 /// Transcribe an audio file to text using a ParakeetTDTCTC model.
@@ -110,9 +112,24 @@ class Transcriber {
     /// Transcribe from raw float32 samples with options.
     TranscribeResult transcribe(const axiom::Tensor &samples,
                                 const TranscribeOptions &opts) {
+        // VAD preprocessing: strip silence, build remapper
+        axiom::Tensor audio_for_asr = samples;
+        std::unique_ptr<audio::TimestampRemapper> remapper;
+
+        if (opts.use_vad && vad_) {
+            auto segments = vad_->detect(samples);
+            if (!segments.empty()) {
+                audio_for_asr = audio::collect_speech(samples, segments);
+                if (opts.timestamps) {
+                    remapper =
+                        std::make_unique<audio::TimestampRemapper>(segments);
+                }
+            }
+        }
+
         AudioConfig audio_cfg;
         audio_cfg.n_mels = config_.encoder.mel_bins;
-        auto features = preprocess_audio(samples, audio_cfg);
+        auto features = preprocess_audio(audio_for_asr, audio_cfg);
         if (use_fp16_)
             features = features.half();
         if (use_gpu_) {
@@ -157,6 +174,12 @@ class Transcriber {
                         result.token_ids.push_back(t.token_id);
                     }
                 }
+            }
+
+            // Remap timestamps if VAD was used
+            if (remapper) {
+                result.timestamped_tokens =
+                    remapper->remap_tokens(result.timestamped_tokens);
             }
 
             if (tokenizer_.loaded()) {
@@ -320,6 +343,15 @@ class Transcriber {
         return results;
     }
 
+    /// Enable VAD preprocessing. Call after to_half()/to_gpu().
+    void enable_vad(const std::string &vad_weights_path) {
+        vad_ = std::make_unique<audio::SileroVAD>(vad_weights_path);
+        if (use_fp16_)
+            vad_->to_half();
+        if (use_gpu_)
+            vad_->to_gpu();
+    }
+
     /// Access the underlying model for advanced use.
     ParakeetTDTCTC &model() { return model_; }
     const Tokenizer &tokenizer() const { return tokenizer_; }
@@ -330,6 +362,7 @@ class Transcriber {
     Tokenizer tokenizer_;
     bool use_gpu_ = false;
     bool use_fp16_ = false;
+    std::unique_ptr<audio::SileroVAD> vad_;
 };
 
 // ─── TDT-Only Transcriber (for 600M multilingual etc.) ─────────────────────
@@ -383,9 +416,24 @@ class TDTTranscriber {
 
     TranscribeResult transcribe(const axiom::Tensor &samples,
                                 const TranscribeOptions &opts) {
+        // VAD preprocessing
+        axiom::Tensor audio_for_asr = samples;
+        std::unique_ptr<audio::TimestampRemapper> remapper;
+
+        if (opts.use_vad && vad_) {
+            auto segments = vad_->detect(samples);
+            if (!segments.empty()) {
+                audio_for_asr = audio::collect_speech(samples, segments);
+                if (opts.timestamps) {
+                    remapper =
+                        std::make_unique<audio::TimestampRemapper>(segments);
+                }
+            }
+        }
+
         AudioConfig audio_cfg;
         audio_cfg.n_mels = config_.encoder.mel_bins;
-        auto features = preprocess_audio(samples, audio_cfg);
+        auto features = preprocess_audio(audio_for_asr, audio_cfg);
         if (use_fp16_)
             features = features.half();
         if (use_gpu_) {
@@ -415,6 +463,12 @@ class TDTTranscriber {
                     result.token_ids.push_back(t.token_id);
                 }
             }
+
+            if (remapper) {
+                result.timestamped_tokens =
+                    remapper->remap_tokens(result.timestamped_tokens);
+            }
+
             if (tokenizer_.loaded()) {
                 result.text = tokenizer_.decode(result.token_ids);
                 result.word_timestamps = group_timestamps(
@@ -537,6 +591,15 @@ class TDTTranscriber {
         return results;
     }
 
+    /// Enable VAD preprocessing. Call after to_half()/to_gpu().
+    void enable_vad(const std::string &vad_weights_path) {
+        vad_ = std::make_unique<audio::SileroVAD>(vad_weights_path);
+        if (use_fp16_)
+            vad_->to_half();
+        if (use_gpu_)
+            vad_->to_gpu();
+    }
+
     ParakeetTDT &model() { return model_; }
     const Tokenizer &tokenizer() const { return tokenizer_; }
 
@@ -546,6 +609,7 @@ class TDTTranscriber {
     Tokenizer tokenizer_;
     bool use_gpu_ = false;
     bool use_fp16_ = false;
+    std::unique_ptr<audio::SileroVAD> vad_;
 };
 
 // ─── Streaming Transcriber ───────────────────────────────────────────────────

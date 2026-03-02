@@ -57,6 +57,12 @@ for (const auto &w : result.word_timestamps) {
 // [0.56s - 0.96s] (0.87) don't
 ```
 
+VAD preprocessing (skip silence, reduce compute):
+```cpp
+t.enable_vad("silero_vad_v5.safetensors");
+auto result = t.transcribe("audio.wav");  // silence auto-filtered, timestamps remapped
+```
+
 Phrase boosting for domain-specific vocabulary:
 ```cpp
 parakeet::TranscribeOptions opts;
@@ -170,6 +176,34 @@ while (auto chunk = get_audio_chunk()) {
 }
 ```
 
+### Voice Activity Detection (Silero VAD)
+
+Strip silence before ASR to reduce encoder compute and improve accuracy. Timestamps are automatically remapped to the original timeline.
+
+```cpp
+parakeet::Transcriber t("model.safetensors", "vocab.txt");
+t.enable_vad("silero_vad_v5.safetensors");
+t.to_gpu();
+
+parakeet::TranscribeOptions opts;
+opts.use_vad = true;
+opts.timestamps = true;
+auto result = t.transcribe("audio.wav", opts);
+// Timestamps refer to the original audio, not the compressed version
+```
+
+Also available as a standalone detector:
+```cpp
+parakeet::audio::SileroVAD vad("silero_vad_v5.safetensors");
+auto segments = vad.detect(audio.samples, 16000);
+// segments[i].start_sample, segments[i].end_sample
+
+// Collect speech-only audio (silence removed)
+auto speech = parakeet::audio::collect_speech(audio.samples, segments);
+```
+
+Works with all transcriber types (`Transcriber`, `TDTTranscriber`, `DiarizedTranscriber`).
+
 ### Diarized Transcription (ASR + Sortformer)
 
 Combines ASR word timestamps with Sortformer speaker diarization to produce speaker-attributed words:
@@ -235,7 +269,21 @@ parakeet_options_free(opts);
 parakeet_transcriber_free(t);
 ```
 
-All 5 transcriber types are wrapped (`parakeet_transcriber_*`, `parakeet_tdt_transcriber_*`, `parakeet_streaming_transcriber_*`, `parakeet_nemotron_transcriber_*`, `parakeet_diarized_transcriber_*`), plus audio I/O and result accessors. Error handling uses a thread-local error string:
+VAD is available through the C API:
+```c
+// Enable VAD on any transcriber
+parakeet_transcriber_enable_vad(t, "silero_vad_v5.safetensors");
+
+// Or use standalone VAD
+parakeet_vad_t vad = parakeet_vad_create("silero_vad_v5.safetensors");
+parakeet_speech_segment_t *segments;
+int count;
+parakeet_vad_detect(vad, audio, parakeet_vad_config_default(), &segments, &count);
+parakeet_speech_segments_free(segments);
+parakeet_vad_destroy(vad);
+```
+
+All 5 transcriber types are wrapped (`parakeet_transcriber_*`, `parakeet_tdt_transcriber_*`, `parakeet_streaming_transcriber_*`, `parakeet_nemotron_transcriber_*`, `parakeet_diarized_transcriber_*`), plus audio I/O, VAD, and result accessors. Error handling uses a thread-local error string:
 
 ```c
 parakeet_transcriber_t t = parakeet_transcriber_create("bad_path", "vocab.txt", NULL);
@@ -355,6 +403,8 @@ Other options:
   --timestamps     Show word-level timestamps
   --streaming      Use streaming mode (eou/nemotron models)
   --latency N      Right context frames for nemotron (0/1/6/13)
+  --vad PATH       Enable Silero VAD with given weights file
+  --vad-threshold F  VAD speech threshold (default: 0.5)
   --features PATH  Load pre-computed features from .npy file
 
 Batch mode:
@@ -398,6 +448,10 @@ Examples:
 
 # Speaker diarization
 ./build/parakeet sortformer.safetensors meeting.wav --model sortformer
+
+# VAD preprocessing (strip silence before ASR)
+./build/parakeet model.safetensors audio.wav --vocab vocab.txt \
+  --vad silero_vad_v5.safetensors --timestamps
 
 # Diarized transcription (ASR + Sortformer)
 ./build/parakeet model.safetensors meeting.wav --model diarized \
@@ -465,6 +519,13 @@ Also supports raw `.ckpt` files and inspection:
 python scripts/convert_nemo.py model_weights.ckpt -o model.safetensors
 python scripts/convert_nemo.py --dump model.nemo  # inspect checkpoint keys
 ```
+
+**Silero VAD weights** (for `--vad` preprocessing):
+```bash
+pip install safetensors torch
+python scripts/convert_silero_vad.py -o silero_vad_v5.safetensors
+```
+Downloads Silero VAD v5 from torch.hub and converts to safetensors (~1.2MB).
 
 ### Download Vocab
 
@@ -597,7 +658,7 @@ Available model flags: `--110m`, `--tdt-600m`, `--rnnt-600m`, `--sortformer`. Al
 
 - [x] **Diarized transcription** — Fuse Sortformer speaker segments with ASR word timestamps. `DiarizedTranscriber` composes ASR + Sortformer into speaker-attributed words.
 - [ ] **Long-form audio chunking** — Split audio >30s into overlapping windows, run encoder on each, merge transcriptions at overlap boundaries.
-- [ ] **VAD (voice activity detection)** — Skip silent regions, reduce compute. Silero VAD integration or energy-based.
+- [x] **VAD (voice activity detection)** — Silero VAD v5 integration. Strips silence before ASR, remaps timestamps to original timeline. `enable_vad()` on all transcribers, standalone `SileroVAD` class, C API, CLI `--vad` flag.
 - [x] **Batch inference** — Pad + length-mask multiple audio files, batch through encoder and decoder. `transcribe_batch()` on `Transcriber` and `TDTTranscriber`. C API and CLI multi-file support.
 - [ ] **Neural LM rescoring** — N-best reranking with a Transformer LM after beam search.
 
