@@ -168,11 +168,9 @@ class Transcriber {
                 bs_opts.beam_width = opts.beam_width;
                 bs_opts.lm = lm.loaded() ? &lm : nullptr;
                 bs_opts.lm_weight = opts.lm_weight;
-                bs_opts.pieces = tokenizer_.loaded()
-                                     ? &tokenizer_.pieces()
-                                     : nullptr;
-                auto all_ts =
-                    ctc_beam_decode_with_timestamps(cpu_lp, bs_opts);
+                bs_opts.pieces =
+                    tokenizer_.loaded() ? &tokenizer_.pieces() : nullptr;
+                auto all_ts = ctc_beam_decode_with_timestamps(cpu_lp, bs_opts);
                 if (!all_ts.empty()) {
                     result.timestamped_tokens = all_ts[0];
                     for (const auto &t : result.timestamped_tokens) {
@@ -227,9 +225,8 @@ class Transcriber {
                 bs_opts.beam_width = opts.beam_width;
                 bs_opts.lm = lm.loaded() ? &lm : nullptr;
                 bs_opts.lm_weight = opts.lm_weight;
-                bs_opts.pieces = tokenizer_.loaded()
-                                     ? &tokenizer_.pieces()
-                                     : nullptr;
+                bs_opts.pieces =
+                    tokenizer_.loaded() ? &tokenizer_.pieces() : nullptr;
                 all_tokens = ctc_beam_decode(cpu_lp, bs_opts);
             } else if (opts.decoder == Decoder::CTC) {
                 auto log_probs = model_.ctc_decoder()(encoder_out);
@@ -331,11 +328,10 @@ class Transcriber {
                 bs_opts.beam_width = opts.beam_width;
                 bs_opts.lm = batch_lm.loaded() ? &batch_lm : nullptr;
                 bs_opts.lm_weight = opts.lm_weight;
-                bs_opts.pieces = tokenizer_.loaded()
-                                     ? &tokenizer_.pieces()
-                                     : nullptr;
-                auto all_ts = ctc_beam_decode_with_timestamps(
-                    cpu_lp, bs_opts, sub_lengths);
+                bs_opts.pieces =
+                    tokenizer_.loaded() ? &tokenizer_.pieces() : nullptr;
+                auto all_ts = ctc_beam_decode_with_timestamps(cpu_lp, bs_opts,
+                                                              sub_lengths);
                 for (size_t b = 0; b < all_ts.size(); ++b) {
                     results[b].timestamped_tokens = all_ts[b];
                     for (const auto &t : all_ts[b])
@@ -386,11 +382,9 @@ class Transcriber {
                 bs_opts.beam_width = opts.beam_width;
                 bs_opts.lm = batch_lm.loaded() ? &batch_lm : nullptr;
                 bs_opts.lm_weight = opts.lm_weight;
-                bs_opts.pieces = tokenizer_.loaded()
-                                     ? &tokenizer_.pieces()
-                                     : nullptr;
-                all_tokens =
-                    ctc_beam_decode(cpu_lp, bs_opts, sub_lengths);
+                bs_opts.pieces =
+                    tokenizer_.loaded() ? &tokenizer_.pieces() : nullptr;
+                all_tokens = ctc_beam_decode(cpu_lp, bs_opts, sub_lengths);
             } else if (opts.decoder == Decoder::CTC) {
                 auto log_probs = model_.ctc_decoder()(encoder_out);
                 auto cpu_lp = log_probs.cpu();

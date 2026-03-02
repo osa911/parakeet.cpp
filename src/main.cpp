@@ -54,9 +54,8 @@ static int run_tdt_ctc_110m(const std::string &weights_path,
                             const std::string &features_path, bool use_ctc,
                             bool use_gpu, bool use_fp16, bool show_timestamps,
                             const std::vector<std::string> &boost_phrases = {},
-                            float boost_score = 5.0f,
-                            bool use_ctc_beam = false, int beam_width = 8,
-                            const std::string &lm_path = "",
+                            float boost_score = 5.0f, bool use_ctc_beam = false,
+                            int beam_width = 8, const std::string &lm_path = "",
                             float lm_weight = 0.5f) {
                             const std::string &vad_weights_path = {},
                             float vad_threshold = 0.5f) {
@@ -185,8 +184,7 @@ static int run_tdt_ctc_110m(const std::string &weights_path,
         bs_opts.beam_width = beam_width;
         bs_opts.lm = arpa_lm.loaded() ? &arpa_lm : nullptr;
         bs_opts.lm_weight = lm_weight;
-        bs_opts.pieces =
-            tokenizer.loaded() ? &tokenizer.pieces() : nullptr;
+        bs_opts.pieces = tokenizer.loaded() ? &tokenizer.pieces() : nullptr;
         if (show_timestamps) {
             timestamped_tokens =
                 ctc_beam_decode_with_timestamps(cpu_lp, bs_opts);

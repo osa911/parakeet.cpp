@@ -29,8 +29,7 @@ const std::string WORD_BOUNDARY = "\xe2\x96\x81";
 
 // Check if a token starts a new word (has ▁ prefix).
 bool is_word_start(int token_id, const std::vector<std::string> *pieces) {
-    if (!pieces || token_id < 0 ||
-        token_id >= static_cast<int>(pieces->size()))
+    if (!pieces || token_id < 0 || token_id >= static_cast<int>(pieces->size()))
         return false;
     const auto &piece = (*pieces)[token_id];
     return piece.size() >= 3 && piece.compare(0, 3, WORD_BOUNDARY) == 0;
@@ -39,8 +38,7 @@ bool is_word_start(int token_id, const std::vector<std::string> *pieces) {
 // Extract the word text from a piece (strip ▁ prefix if present).
 std::string piece_to_word(int token_id,
                           const std::vector<std::string> *pieces) {
-    if (!pieces || token_id < 0 ||
-        token_id >= static_cast<int>(pieces->size()))
+    if (!pieces || token_id < 0 || token_id >= static_cast<int>(pieces->size()))
         return "";
     const auto &piece = (*pieces)[token_id];
     if (piece.size() >= 3 && piece.compare(0, 3, WORD_BOUNDARY) == 0) {
@@ -88,9 +86,7 @@ struct Hypothesis {
     float total_score() const { return log_add(p_blank, p_non_blank); }
 
     // Combined score with LM
-    float combined_score() const {
-        return total_score() + lm_score;
-    }
+    float combined_score() const { return total_score() + lm_score; }
 };
 
 // Hash for prefix vectors — used as map key
@@ -98,8 +94,8 @@ struct PrefixHash {
     size_t operator()(const std::vector<int> &v) const {
         size_t seed = v.size();
         for (auto &i : v) {
-            seed ^= static_cast<size_t>(i) + 0x9e3779b9 + (seed << 6) +
-                     (seed >> 2);
+            seed ^=
+                static_cast<size_t>(i) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
         }
         return seed;
     }
@@ -133,16 +129,14 @@ Hypothesis beam_search_single(const float *log_probs_data, int T, int V,
 
         for (const auto &hyp : beam) {
             float p_total = hyp.total_score();
-            int last_token =
-                hyp.prefix.empty() ? -1 : hyp.prefix.back();
+            int last_token = hyp.prefix.empty() ? -1 : hyp.prefix.back();
 
             // 1. Extend with blank
             {
                 float p = p_total + frame[blank_id];
                 auto it = next_beam.find(hyp.prefix);
                 if (it != next_beam.end()) {
-                    it->second.p_blank =
-                        log_add(it->second.p_blank, p);
+                    it->second.p_blank = log_add(it->second.p_blank, p);
                 } else {
                     Hypothesis h;
                     h.prefix = hyp.prefix;
@@ -175,24 +169,26 @@ Hypothesis beam_search_single(const float *log_probs_data, int T, int V,
                 top_tokens.push_back({v, frame[v]});
             }
             // Partial sort to get top beam_width * 2 candidates
-            int k = std::min(static_cast<int>(top_tokens.size()),
-                             beam_width * 2);
+            int k =
+                std::min(static_cast<int>(top_tokens.size()), beam_width * 2);
             if (k < static_cast<int>(top_tokens.size())) {
-                std::partial_sort(
-                    top_tokens.begin(), top_tokens.begin() + k,
-                    top_tokens.end(),
-                    [](const TokenScore &a, const TokenScore &b) {
-                        return a.score > b.score;
-                    });
+                std::partial_sort(top_tokens.begin(), top_tokens.begin() + k,
+                                  top_tokens.end(),
+                                  [](const TokenScore &a, const TokenScore &b) {
+                                      return a.score > b.score;
+                                  });
                 top_tokens.resize(k);
             }
 
             for (const auto &[token_id, log_p] : top_tokens) {
                 if (token_id == last_token) {
-                    // Same as last token in prefix
-                    // Case A: after blank → extends prefix
+                    // Same as last token in prefix — two sub-cases:
+
+                    // Case A: from non-blank ending → continued emission
+                    // of the same token, keeps prefix y unchanged.
+                    // p_nb(y) += p_nb(y) * P(c|t)
                     {
-                        float p = hyp.p_blank + log_p;
+                        float p = hyp.p_non_blank + log_p;
                         auto it = next_beam.find(hyp.prefix);
                         if (it != next_beam.end()) {
                             it->second.p_non_blank =
@@ -209,11 +205,13 @@ Hypothesis beam_search_single(const float *log_probs_data, int T, int V,
                         }
                     }
 
-                    // Case B: after non-blank → repeat = new token (extends)
+                    // Case B: from blank ending → blank-separated repeat,
+                    // creates new prefix y+c.
+                    // p_nb(y+c) += p_b(y) * P(c|t)
                     {
                         std::vector<int> new_prefix = hyp.prefix;
                         new_prefix.push_back(token_id);
-                        float p = hyp.p_non_blank + log_p;
+                        float p = hyp.p_blank + log_p;
 
                         float lm_bonus = 0.0f;
                         ArpaLM::State new_lm_state = hyp.lm_state;
@@ -223,7 +221,6 @@ Hypothesis beam_search_single(const float *log_probs_data, int T, int V,
                             if (!word.empty()) {
                                 new_lm_state = hyp.lm_state;
                                 float lm_lp = lm->score(new_lm_state, word);
-                                // Convert log10 to ln for compatibility
                                 lm_bonus = lm_weight * lm_lp * std::log(10.0f);
                             }
                         }
@@ -232,11 +229,8 @@ Hypothesis beam_search_single(const float *log_probs_data, int T, int V,
                         if (it != next_beam.end()) {
                             it->second.p_non_blank =
                                 log_add(it->second.p_non_blank, p);
-                            // Keep the better LM state
-                            if (hyp.lm_score + lm_bonus >
-                                it->second.lm_score) {
-                                it->second.lm_score =
-                                    hyp.lm_score + lm_bonus;
+                            if (hyp.lm_score + lm_bonus > it->second.lm_score) {
+                                it->second.lm_score = hyp.lm_score + lm_bonus;
                                 it->second.lm_state = new_lm_state;
                             }
                         } else {
@@ -261,8 +255,7 @@ Hypothesis beam_search_single(const float *log_probs_data, int T, int V,
                     ArpaLM::State new_lm_state = hyp.lm_state;
                     if (use_lm && is_word_start(token_id, pieces)) {
                         // Score the completed word before this new word start
-                        std::string word =
-                            get_current_word(hyp.prefix, pieces);
+                        std::string word = get_current_word(hyp.prefix, pieces);
                         if (!word.empty()) {
                             new_lm_state = hyp.lm_state;
                             float lm_lp = lm->score(new_lm_state, word);
@@ -274,10 +267,8 @@ Hypothesis beam_search_single(const float *log_probs_data, int T, int V,
                     if (it != next_beam.end()) {
                         it->second.p_non_blank =
                             log_add(it->second.p_non_blank, p);
-                        if (hyp.lm_score + lm_bonus >
-                            it->second.lm_score) {
-                            it->second.lm_score =
-                                hyp.lm_score + lm_bonus;
+                        if (hyp.lm_score + lm_bonus > it->second.lm_score) {
+                            it->second.lm_score = hyp.lm_score + lm_bonus;
                             it->second.lm_state = new_lm_state;
                         }
                     } else {
@@ -303,8 +294,7 @@ Hypothesis beam_search_single(const float *log_probs_data, int T, int V,
         }
         std::partial_sort(
             beam.begin(),
-            beam.begin() + std::min(beam_width,
-                                    static_cast<int>(beam.size())),
+            beam.begin() + std::min(beam_width, static_cast<int>(beam.size())),
             beam.end(), [](const Hypothesis &a, const Hypothesis &b) {
                 return a.combined_score() > b.combined_score();
             });
@@ -319,8 +309,7 @@ Hypothesis beam_search_single(const float *log_probs_data, int T, int V,
     }
 
     auto best = std::max_element(
-        beam.begin(), beam.end(),
-        [](const Hypothesis &a, const Hypothesis &b) {
+        beam.begin(), beam.end(), [](const Hypothesis &a, const Hypothesis &b) {
             return a.combined_score() < b.combined_score();
         });
 
@@ -331,10 +320,9 @@ Hypothesis beam_search_single(const float *log_probs_data, int T, int V,
 
 // ─── Public API ─────────────────────────────────────────────────────────────
 
-std::vector<std::vector<int>>
-ctc_beam_decode(const axiom::Tensor &log_probs,
-                const BeamSearchOptions &opts,
-                const std::vector<int> &lengths) {
+std::vector<std::vector<int>> ctc_beam_decode(const axiom::Tensor &log_probs,
+                                              const BeamSearchOptions &opts,
+                                              const std::vector<int> &lengths) {
     auto lp = log_probs.to_float().ascontiguousarray();
     auto shape = lp.shape();
     int batch_size = static_cast<int>(shape[0]);
@@ -383,9 +371,8 @@ ctc_beam_decode_with_timestamps(const axiom::Tensor &log_probs,
         tokens.reserve(best.prefix.size());
 
         for (size_t i = 0; i < best.prefix.size(); ++i) {
-            int frame = (i < best.emission_frames.size())
-                            ? best.emission_frames[i]
-                            : 0;
+            int frame =
+                (i < best.emission_frames.size()) ? best.emission_frames[i] : 0;
             // Look up the log-prob at the emission frame for confidence
             float log_p = -1.0f;
             if (frame < T) {
@@ -394,15 +381,13 @@ ctc_beam_decode_with_timestamps(const axiom::Tensor &log_probs,
             float confidence = std::exp(log_p);
 
             // Estimate end_frame: next token's start - 1, or T-1 for last
-            int end_frame =
-                (i + 1 < best.emission_frames.size())
-                    ? best.emission_frames[i + 1] - 1
-                    : T - 1;
+            int end_frame = (i + 1 < best.emission_frames.size())
+                                ? best.emission_frames[i + 1] - 1
+                                : T - 1;
             if (end_frame < frame)
                 end_frame = frame;
 
-            tokens.push_back(
-                {best.prefix[i], frame, end_frame, confidence});
+            tokens.push_back({best.prefix[i], frame, end_frame, confidence});
         }
     }
 

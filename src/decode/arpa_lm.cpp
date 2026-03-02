@@ -73,9 +73,8 @@ void ArpaLM::load(const std::string &path) {
             continue;
 
         // Trim trailing whitespace/CR
-        while (!line.empty() &&
-               (line.back() == '\r' || line.back() == ' ' ||
-                line.back() == '\t'))
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ' ||
+                                 line.back() == '\t'))
             line.pop_back();
 
         if (line == "\\data\\") {
@@ -101,8 +100,7 @@ void ArpaLM::load(const std::string &path) {
         // Check for "\N-grams:" section header
         if (line.size() > 2 && line[0] == '\\' &&
             line.find("-grams:") != std::string::npos) {
-            current_order =
-                std::stoi(line.substr(1, line.find('-') - 1));
+            current_order = std::stoi(line.substr(1, line.find('-') - 1));
             in_data = false;
             continue;
         }
@@ -125,11 +123,12 @@ void ArpaLM::load(const std::string &path) {
         if (words.empty())
             continue;
 
-        // Last element might be a backoff weight (for non-highest-order n-grams)
+        // Last element might be a backoff weight (for non-highest-order
+        // n-grams)
         float backoff = 0.0f;
         bool has_backoff = false;
-        if (current_order < order_ &&
-            static_cast<int>(words.size()) > current_order) {
+        if (current_order<order_ &&static_cast<int>(words.size())>
+                current_order) {
             // The extra token is the backoff weight
             try {
                 backoff = std::stof(words.back());
