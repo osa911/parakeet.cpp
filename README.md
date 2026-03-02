@@ -38,6 +38,13 @@ auto result = t.transcribe("audio.wav", parakeet::Decoder::CTC);  // fast greedy
 auto result = t.transcribe("audio.wav", parakeet::Decoder::TDT);  // better accuracy (default)
 ```
 
+Batch transcription (multiple files in one forward pass):
+```cpp
+auto results = t.transcribe_batch({"audio1.wav", "audio2.wav", "audio3.wav"});
+for (const auto &r : results)
+    std::cout << r.text << std::endl;
+```
+
 Word-level timestamps with confidence:
 ```cpp
 auto result = t.transcribe("audio.wav", parakeet::Decoder::TDT, /*timestamps=*/true);
@@ -67,6 +74,26 @@ parakeet::Transcriber t("model.safetensors", "vocab.txt");
 t.to_gpu();
 auto result = t.transcribe("audio.wav");
 ```
+
+### Batch Transcription
+
+Process multiple audio files in a single batched encoder forward pass for better GPU utilization:
+
+```cpp
+parakeet::Transcriber t("model.safetensors", "vocab.txt");
+t.to_gpu();
+
+auto results = t.transcribe_batch({"audio1.wav", "audio2.wav", "audio3.wav"});
+for (size_t i = 0; i < results.size(); ++i)
+    std::cout << results[i].text << std::endl;
+
+// Works with options too
+parakeet::TranscribeOptions opts;
+opts.timestamps = true;
+auto results = t.transcribe_batch({"a.wav", "b.wav"}, opts);
+```
+
+Also available on `TDTTranscriber` for the 600M model, via C API (`parakeet_transcriber_transcribe_batch`), and the CLI (multiple positional args).
 
 ### Offline Transcription (TDT 600M Multilingual)
 
@@ -305,7 +332,7 @@ auto encoder_out = model.encoder()(features_gpu);
 ## CLI
 
 ```
-Usage: parakeet <model.safetensors> <audio.wav> [options]
+Usage: parakeet <model.safetensors> <audio.wav> [audio2.wav ...] [options]
 
 Model types:
   --model TYPE     Model type (default: tdt-ctc-110m)
@@ -329,6 +356,10 @@ Other options:
   --streaming      Use streaming mode (eou/nemotron models)
   --latency N      Right context frames for nemotron (0/1/6/13)
   --features PATH  Load pre-computed features from .npy file
+
+Batch mode:
+  Multiple audio files use batched encoder inference.
+  Supported for tdt-ctc-110m and tdt-600m models.
 ```
 
 Examples:
@@ -352,6 +383,9 @@ Examples:
 # Phrase boosting for domain-specific terms
 ./build/parakeet model.safetensors audio.wav --vocab vocab.txt \
   --boost "Phoebe" --boost "portrait" --boost-score 5.0
+
+# Batch inference (multiple files in one forward pass)
+./build/parakeet model.safetensors audio1.wav audio2.wav audio3.wav --vocab vocab.txt --gpu
 
 # 600M multilingual TDT model
 ./build/parakeet model.safetensors audio.wav --vocab vocab.txt --model tdt-600m
@@ -564,7 +598,7 @@ Available model flags: `--110m`, `--tdt-600m`, `--rnnt-600m`, `--sortformer`. Al
 - [x] **Diarized transcription** — Fuse Sortformer speaker segments with ASR word timestamps. `DiarizedTranscriber` composes ASR + Sortformer into speaker-attributed words.
 - [ ] **Long-form audio chunking** — Split audio >30s into overlapping windows, run encoder on each, merge transcriptions at overlap boundaries.
 - [ ] **VAD (voice activity detection)** — Skip silent regions, reduce compute. Silero VAD integration or energy-based.
-- [ ] **Batch inference** — Pad + length-mask multiple audio files, batch through encoder and decoder. GPU utilization improvement.
+- [x] **Batch inference** — Pad + length-mask multiple audio files, batch through encoder and decoder. `transcribe_batch()` on `Transcriber` and `TDTTranscriber`. C API and CLI multi-file support.
 - [ ] **Neural LM rescoring** — N-best reranking with a Transformer LM after beam search.
 
 ### Tier 3 — Ecosystem
