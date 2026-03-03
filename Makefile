@@ -16,7 +16,7 @@ else
     BUILD_CMD    := $(MAKE) -C $(BUILD_DIR) -j$(NPROC)
 endif
 
-.PHONY: all configure build run test bench bench-single debug install format format-check clean
+.PHONY: all configure build run test bench bench-single debug install format format-check clean samples
 
 all: build
 
@@ -53,3 +53,13 @@ format-check:
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+samples:
+	@echo "Downloading samples..."
+	@mkdir -p samples
+	@wget --quiet --show-progress -O samples/gb0.ogg "https://upload.wikimedia.org/wikipedia/commons/2/22/George_W._Bush%27s_weekly_radio_address_%28November_1%2C_2008%29.oga"
+	@wget --quiet --show-progress -O samples/gb1.ogg "https://upload.wikimedia.org/wikipedia/commons/1/1f/George_W_Bush_Columbia_FINAL.ogg"
+	@wget --quiet --show-progress -O samples/hp0.ogg "https://upload.wikimedia.org/wikipedia/en/d/d4/En.henryfphillips.ogg"
+	@wget --quiet --show-progress -O samples/mm1.wav "https://cdn.openai.com/whisper/draft-20220913a/micro-machines.wav"
+	@wget --quiet --show-progress -O samples/a13.mp3 "https://upload.wikimedia.org/wikipedia/commons/transcoded/6/6f/Apollo13-wehaveaproblem.ogg/Apollo13-wehaveaproblem.ogg.mp3"
+	@wget --quiet --show-progress -O samples/diffusion2023-07-03.flac "https://archive.org/download/diffusion2023-07-03/diffusion2023-07-03.flac"

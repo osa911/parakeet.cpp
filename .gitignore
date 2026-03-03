@@ -1,6 +1,7 @@
 build/
 .cache/
 /models/
+/samples/
 venv/
 .venv/
 plan.md
