@@ -192,10 +192,13 @@ std::vector<std::vector<int>> tdt_greedy_decode_boosted(
     int batch_size = static_cast<int>(shape[0]);
     int seq_len = static_cast<int>(shape[1]);
 
+    // Pre-project all encoder frames once
+    auto enc_projected = joint.project_encoder(encoder_out);
+
     std::vector<std::vector<int>> results(batch_size);
 
     for (int b = 0; b < batch_size; ++b) {
-        auto enc = encoder_out.slice({Slice(b, b + 1)});
+        auto enc = enc_projected.slice({Slice(b, b + 1)});
         int T = (!lengths.empty() && b < static_cast<int>(lengths.size()))
                     ? lengths[b]
                     : seq_len;
@@ -222,7 +225,8 @@ std::vector<std::vector<int>> tdt_greedy_decode_boosted(
                 auto pred = prediction.step(token, states);
                 pred = pred.unsqueeze(1);
 
-                auto [label_lp, dur_lp] = joint.forward(enc_t, pred);
+                auto [label_lp, dur_lp] =
+                    joint.forward_projected(enc_t, pred);
 
                 // Manual argmax with boost on label log-probs
                 auto label_1d =
@@ -296,10 +300,13 @@ tdt_greedy_decode_with_timestamps_boosted(
     int batch_size = static_cast<int>(shape[0]);
     int seq_len = static_cast<int>(shape[1]);
 
+    // Pre-project all encoder frames once
+    auto enc_projected = joint.project_encoder(encoder_out);
+
     std::vector<std::vector<TimestampedToken>> results(batch_size);
 
     for (int b = 0; b < batch_size; ++b) {
-        auto enc = encoder_out.slice({Slice(b, b + 1)});
+        auto enc = enc_projected.slice({Slice(b, b + 1)});
         int T = (!lengths.empty() && b < static_cast<int>(lengths.size()))
                     ? lengths[b]
                     : seq_len;
@@ -326,7 +333,8 @@ tdt_greedy_decode_with_timestamps_boosted(
                 auto pred = prediction.step(token, states);
                 pred = pred.unsqueeze(1);
 
-                auto [label_lp, dur_lp] = joint.forward(enc_t, pred);
+                auto [label_lp, dur_lp] =
+                    joint.forward_projected(enc_t, pred);
 
                 auto label_1d =
                     label_lp.squeeze(0).squeeze(0).to_contiguous_cpu();

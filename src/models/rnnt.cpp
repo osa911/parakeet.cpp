@@ -36,8 +36,12 @@ RNNTJoint::RNNTJoint(const JointConfig &config)
 
 Tensor RNNTJoint::forward(const Tensor &encoder_out,
                           const Tensor &prediction_out) const {
-    // Broadcast add: enc (batch, 1, joint) + pred (batch, 1, joint)
-    auto x = enc_proj_(encoder_out) + pred_proj_(prediction_out);
+    return forward_projected(enc_proj_(encoder_out), prediction_out);
+}
+
+Tensor RNNTJoint::forward_projected(const Tensor &enc_projected,
+                                    const Tensor &prediction_out) const {
+    auto x = enc_projected + pred_proj_(prediction_out);
     x = ops::relu(x);
     x = out_proj_(x);
     return ops::log_softmax(x, /*axis=*/-1);
@@ -61,13 +65,14 @@ std::vector<std::vector<int>> rnnt_greedy_decode(ParakeetRNNT &model,
     int batch_size = static_cast<int>(shape[0]);
     int seq_len = static_cast<int>(shape[1]);
 
+    // Pre-project all encoder frames once
+    auto enc_projected = model.joint().project_encoder(encoder_out);
+
     std::vector<std::vector<int>> results(batch_size);
 
     for (int b = 0; b < batch_size; ++b) {
-        // Extract single batch element: (1, seq, hidden)
-        auto enc = encoder_out.slice({Slice(b, b + 1)});
+        auto enc = enc_projected.slice({Slice(b, b + 1)});
 
-        // Initialize LSTM states to zeros
         int num_layers = model.prediction().config().num_lstm_layers;
         size_t hs = model.prediction().config().pred_hidden;
         std::vector<LSTMState> states(num_layers);
@@ -76,25 +81,23 @@ std::vector<std::vector<int>> rnnt_greedy_decode(ParakeetRNNT &model,
                          Tensor::zeros({1, hs}, encoder_out.dtype())};
         }
 
-        // Start with blank token (SOS)
         auto token = Tensor({1}, DType::Int32);
         token.fill(blank_id);
 
         for (int t = 0; t < seq_len; ++t) {
-            auto enc_t =
-                enc.slice({Slice(), Slice(t, t + 1)}); // (1, 1, hidden)
+            auto enc_t = enc.slice({Slice(), Slice(t, t + 1)});
 
             for (int sym = 0; sym < max_symbols_per_step; ++sym) {
                 auto saved_states = states;
 
                 auto pred = model.prediction().step(token, states);
-                pred = pred.unsqueeze(1); // (1, 1, pred_hidden)
+                pred = pred.unsqueeze(1);
 
-                auto logits = model.joint().forward(enc_t, pred);
-                // logits: (1, 1, vocab)
-                auto best =
-                    ops::argmax(logits.squeeze(0).squeeze(0), /*axis=*/-1);
-                int token_id = best.item<int>();
+                auto logits = model.joint().forward_projected(enc_t, pred);
+
+                int token_id =
+                    ops::argmax(logits.squeeze(0).squeeze(0), -1)
+                        .item<int>();
 
                 if (token_id == blank_id) {
                     states = saved_states;
@@ -121,10 +124,13 @@ rnnt_greedy_decode_with_timestamps(ParakeetRNNT &model,
     int batch_size = static_cast<int>(shape[0]);
     int seq_len = static_cast<int>(shape[1]);
 
+    // Pre-project all encoder frames once
+    auto enc_projected = model.joint().project_encoder(encoder_out);
+
     std::vector<std::vector<TimestampedToken>> results(batch_size);
 
     for (int b = 0; b < batch_size; ++b) {
-        auto enc = encoder_out.slice({Slice(b, b + 1)});
+        auto enc = enc_projected.slice({Slice(b, b + 1)});
 
         int num_layers = model.prediction().config().num_lstm_layers;
         size_t hs = model.prediction().config().pred_hidden;
@@ -146,9 +152,9 @@ rnnt_greedy_decode_with_timestamps(ParakeetRNNT &model,
                 auto pred = model.prediction().step(token, states);
                 pred = pred.unsqueeze(1);
 
-                auto logits = model.joint().forward(enc_t, pred);
+                auto logits = model.joint().forward_projected(enc_t, pred);
 
-                // Manual argmax to get both index and log-prob
+                // Pull to CPU for argmax + confidence
                 auto lp_1d = logits.squeeze(0).squeeze(0).to_contiguous_cpu();
                 const float *lp_data = lp_1d.typed_data<float>();
                 int vocab_size = static_cast<int>(lp_1d.shape()[0]);

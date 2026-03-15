@@ -36,10 +36,13 @@ std::vector<int> rnnt_streaming_decode_chunk(
     int chunk_len = static_cast<int>(encoder_chunk.shape()[1]);
     std::vector<int> new_tokens;
 
+    // Pre-project all encoder frames in this chunk once
+    auto enc_projected = joint.project_encoder(encoder_chunk);
+
     int base_frame = state.frame_offset;
     int t = 0;
     while (t < chunk_len) {
-        auto enc_t = encoder_chunk.slice({Slice(), Slice(t, t + 1)});
+        auto enc_t = enc_projected.slice({Slice(), Slice(t, t + 1)});
 
         bool frame_advanced = false;
         for (int sym = 0; sym < max_symbols_per_step; ++sym) {
@@ -48,7 +51,7 @@ std::vector<int> rnnt_streaming_decode_chunk(
             auto pred = prediction.step(state.last_token, state.lstm_states);
             pred = pred.unsqueeze(1);
 
-            auto [label_lp, dur_lp] = joint.forward(enc_t, pred);
+            auto [label_lp, dur_lp] = joint.forward_projected(enc_t, pred);
 
             // Manual argmax on label log-probs for index + confidence
             auto label_1d = label_lp.squeeze(0).squeeze(0).to_contiguous_cpu();

@@ -54,6 +54,15 @@ class RNNTJoint : public Module {
     Tensor forward(const Tensor &encoder_out,
                    const Tensor &prediction_out) const;
 
+    // Pre-project all encoder frames at once.
+    Tensor project_encoder(const Tensor &encoder_out) const {
+        return enc_proj_(encoder_out);
+    }
+
+    // Forward using pre-projected encoder output (skips enc_proj_).
+    Tensor forward_projected(const Tensor &enc_projected,
+                             const Tensor &prediction_out) const;
+
     const JointConfig &config() const { return config_; }
 
   private:

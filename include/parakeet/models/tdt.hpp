@@ -35,6 +35,16 @@ class TDTJoint : public Module {
     Output forward(const Tensor &encoder_out,
                    const Tensor &prediction_out) const;
 
+    // Pre-project all encoder frames at once: (batch, seq, hidden) →
+    // (batch, seq, joint_hidden). Call once before the decode loop.
+    Tensor project_encoder(const Tensor &encoder_out) const {
+        return enc_proj_(encoder_out);
+    }
+
+    // Forward using pre-projected encoder output (skips enc_proj_).
+    Output forward_projected(const Tensor &enc_projected,
+                             const Tensor &prediction_out) const;
+
     const JointConfig &config() const { return config_; }
     int num_durations() const { return num_durations_; }
 

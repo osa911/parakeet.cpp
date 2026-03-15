@@ -14,7 +14,12 @@ TDTJoint::TDTJoint(const JointConfig &config, int num_durations)
 
 TDTJoint::Output TDTJoint::forward(const Tensor &encoder_out,
                                    const Tensor &prediction_out) const {
-    auto hidden = enc_proj_(encoder_out) + pred_proj_(prediction_out);
+    return forward_projected(enc_proj_(encoder_out), prediction_out);
+}
+
+TDTJoint::Output TDTJoint::forward_projected(
+    const Tensor &enc_projected, const Tensor &prediction_out) const {
+    auto hidden = enc_projected + pred_proj_(prediction_out);
     hidden = ops::relu(hidden);
 
     auto label_logits = ops::log_softmax(label_proj_(hidden), /*axis=*/-1);
@@ -47,10 +52,13 @@ tdt_greedy_decode(RNNTPrediction &prediction, TDTJoint &joint,
     int batch_size = static_cast<int>(shape[0]);
     int seq_len = static_cast<int>(shape[1]);
 
+    // Pre-project all encoder frames once (avoids per-frame enc_proj_)
+    auto enc_projected = joint.project_encoder(encoder_out);
+
     std::vector<std::vector<int>> results(batch_size);
 
     for (int b = 0; b < batch_size; ++b) {
-        auto enc = encoder_out.slice({Slice(b, b + 1)}); // (1, seq, hidden)
+        auto enc = enc_projected.slice({Slice(b, b + 1)});
         int T = (!lengths.empty() && b < static_cast<int>(lengths.size()))
                     ? lengths[b]
                     : seq_len;
@@ -63,46 +71,39 @@ tdt_greedy_decode(RNNTPrediction &prediction, TDTJoint &joint,
                          Tensor::zeros({1, hs}, encoder_out.dtype())};
         }
 
-        // Start with blank token (SOS) — blank embedding is all zeros,
-        // matching NeMo's _SOS = _blank_index behavior.
         auto token = Tensor({1}, DType::Int32);
         token.fill(blank_id);
         int t = 0;
 
         while (t < T) {
-            auto enc_t =
-                enc.slice({Slice(), Slice(t, t + 1)}); // (1, 1, hidden)
+            auto enc_t = enc.slice({Slice(), Slice(t, t + 1)});
 
             bool frame_advanced = false;
             for (int sym = 0; sym < max_symbols_per_step; ++sym) {
-                // Save LSTM states before prediction step.
-                // On blank, we must revert to these (NeMo only updates
-                // decoder state on non-blank emissions).
                 auto saved_states = states;
 
                 auto pred = prediction.step(token, states);
-                pred = pred.unsqueeze(1); // (1, 1, pred_hidden)
+                pred = pred.unsqueeze(1);
 
-                auto [label_lp, dur_lp] = joint.forward(enc_t, pred);
+                auto [label_lp, dur_lp] =
+                    joint.forward_projected(enc_t, pred);
 
-                // Get best label and duration
-                auto best_label =
-                    ops::argmax(label_lp.squeeze(0).squeeze(0), -1);
-                int token_id = best_label.item<int>();
+                // GPU argmax: transfers only 4 bytes instead of vocab_size*4
+                int token_id =
+                    ops::argmax(label_lp.squeeze(0).squeeze(0), -1)
+                        .item<int>();
 
-                // Duration: RNNT models have no duration head (empty dur_lp)
                 int skip = 1;
                 if (dur_lp.storage()) {
-                    auto best_dur =
-                        ops::argmax(dur_lp.squeeze(0).squeeze(0), -1);
-                    int dur_idx = best_dur.item<int>();
+                    int dur_idx =
+                        ops::argmax(dur_lp.squeeze(0).squeeze(0), -1)
+                            .item<int>();
                     skip = (dur_idx < static_cast<int>(durations.size()))
                                ? durations[dur_idx]
                                : 1;
                 }
 
                 if (token_id == blank_id) {
-                    // Revert LSTM state — blank doesn't update decoder
                     states = saved_states;
                     t += std::max(skip, 1);
                     frame_advanced = true;
@@ -113,19 +114,13 @@ tdt_greedy_decode(RNNTPrediction &prediction, TDTJoint &joint,
                 token = Tensor({1}, DType::Int32);
                 token.fill(token_id);
 
-                // Non-blank with duration > 0 means skip frames
                 if (skip > 0) {
                     t += skip;
                     frame_advanced = true;
                     break;
                 }
-                // duration 0: emit another symbol on same frame
             }
 
-            // If max_symbols_per_step reached without advancing the frame
-            // (all predicted tokens were non-blank with duration 0), force
-            // advance by 1 to prevent an infinite loop. This matches NeMo's
-            // behavior where the outer time loop always progresses.
             if (!frame_advanced) {
                 t += 1;
             }
@@ -154,10 +149,13 @@ std::vector<std::vector<TimestampedToken>> tdt_greedy_decode_with_timestamps(
     int batch_size = static_cast<int>(shape[0]);
     int seq_len = static_cast<int>(shape[1]);
 
+    // Pre-project all encoder frames once
+    auto enc_projected = joint.project_encoder(encoder_out);
+
     std::vector<std::vector<TimestampedToken>> results(batch_size);
 
     for (int b = 0; b < batch_size; ++b) {
-        auto enc = encoder_out.slice({Slice(b, b + 1)});
+        auto enc = enc_projected.slice({Slice(b, b + 1)});
         int T = (!lengths.empty() && b < static_cast<int>(lengths.size()))
                     ? lengths[b]
                     : seq_len;
@@ -184,9 +182,10 @@ std::vector<std::vector<TimestampedToken>> tdt_greedy_decode_with_timestamps(
                 auto pred = prediction.step(token, states);
                 pred = pred.unsqueeze(1);
 
-                auto [label_lp, dur_lp] = joint.forward(enc_t, pred);
+                auto [label_lp, dur_lp] =
+                    joint.forward_projected(enc_t, pred);
 
-                // Manual argmax on label log-probs to get both index and value
+                // Pull label log-probs to CPU for argmax + confidence
                 auto label_1d =
                     label_lp.squeeze(0).squeeze(0).to_contiguous_cpu();
                 const float *label_data = label_1d.typed_data<float>();
@@ -201,12 +200,11 @@ std::vector<std::vector<TimestampedToken>> tdt_greedy_decode_with_timestamps(
                 }
                 float confidence = std::exp(best_lp);
 
-                // Duration: RNNT models have no duration head (empty dur_lp)
                 int skip = 1;
                 if (dur_lp.storage()) {
-                    auto best_dur =
-                        ops::argmax(dur_lp.squeeze(0).squeeze(0), -1);
-                    int dur_idx = best_dur.item<int>();
+                    int dur_idx =
+                        ops::argmax(dur_lp.squeeze(0).squeeze(0), -1)
+                            .item<int>();
                     skip = (dur_idx < static_cast<int>(durations.size()))
                                ? durations[dur_idx]
                                : 1;
@@ -219,7 +217,6 @@ std::vector<std::vector<TimestampedToken>> tdt_greedy_decode_with_timestamps(
                     break;
                 }
 
-                // Record token with start=t, end=t+duration
                 int end_frame = t + std::max(skip, 1) - 1;
                 if (end_frame >= T)
                     end_frame = T - 1;
@@ -235,8 +232,6 @@ std::vector<std::vector<TimestampedToken>> tdt_greedy_decode_with_timestamps(
                 }
             }
 
-            // If max_symbols_per_step reached without advancing the frame,
-            // force advance by 1 to prevent an infinite loop.
             if (!frame_advanced) {
                 t += 1;
             }
