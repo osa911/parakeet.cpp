@@ -77,7 +77,8 @@ struct TDTHypothesis {
 
 // Expand a single hypothesis at encoder frame t.
 // Adds resulting candidates to `candidates`.
-void expand_hypothesis(TDTHypothesis &hyp, const Tensor &enc_t,
+// expand_hypothesis takes pre-projected encoder frame (enc_proj already applied)
+void expand_hypothesis(TDTHypothesis &hyp, const Tensor &enc_t_projected,
                        RNNTPrediction &prediction, TDTJoint &joint,
                        const std::vector<int> &durations, int t, int T,
                        int remaining, const TDTBeamSearchOptions &opts,
@@ -97,7 +98,7 @@ void expand_hypothesis(TDTHypothesis &hyp, const Tensor &enc_t,
     auto pred = prediction.step(token_tensor, hyp.states);
     pred = pred.unsqueeze(1); // (1, 1, pred_hidden)
 
-    auto [label_lp, dur_lp] = joint.forward(enc_t, pred);
+    auto [label_lp, dur_lp] = joint.forward_projected(enc_t_projected, pred);
 
     // Flatten and move to CPU for reading
     auto label_1d = label_lp.squeeze(0).squeeze(0).to_contiguous_cpu();
@@ -212,14 +213,15 @@ void expand_hypothesis(TDTHypothesis &hyp, const Tensor &enc_t,
             }
 
             // Recursively expand this new hypothesis on the same frame
-            expand_hypothesis(recurse_hyp, enc_t, prediction, joint, durations,
-                              t, T, remaining - 1, opts, candidates);
+            expand_hypothesis(recurse_hyp, enc_t_projected, prediction, joint,
+                              durations, t, T, remaining - 1, opts,
+                              candidates);
         }
     }
 }
 
 // Run TDT beam search on a single batch element.
-TDTHypothesis tdt_beam_search_single(const Tensor &enc, int T,
+TDTHypothesis tdt_beam_search_single(const Tensor &enc_projected, int T,
                                      RNNTPrediction &prediction,
                                      TDTJoint &joint,
                                      const std::vector<int> &durations,
@@ -238,14 +240,15 @@ TDTHypothesis tdt_beam_search_single(const Tensor &enc, int T,
     beam[0].next_frame = 0;
     beam[0].states.resize(num_layers);
     for (int l = 0; l < num_layers; ++l) {
-        beam[0].states[l] = {Tensor::zeros({1, hs}, enc.dtype()),
-                             Tensor::zeros({1, hs}, enc.dtype())};
+        beam[0].states[l] = {Tensor::zeros({1, hs}, enc_projected.dtype()),
+                             Tensor::zeros({1, hs}, enc_projected.dtype())};
     }
     if (use_lm)
         beam[0].lm_state = opts.lm->initial_state();
 
     for (int t = 0; t < T; ++t) {
-        auto enc_t = enc.slice({Slice(), Slice(t, t + 1)}); // (1, 1, hidden)
+        // enc_projected is already through enc_proj_
+        auto enc_t = enc_projected.slice({Slice(), Slice(t, t + 1)});
 
         // Partition beam into ready (next_frame == t) and waiting (> t)
         std::vector<TDTHypothesis> candidates;
@@ -305,10 +308,13 @@ std::vector<std::vector<int>> tdt_beam_decode(RNNTPrediction &prediction,
     int batch_size = static_cast<int>(shape[0]);
     int seq_len = static_cast<int>(shape[1]);
 
+    // Pre-project all encoder frames once
+    auto enc_projected = joint.project_encoder(encoder_out);
+
     std::vector<std::vector<int>> results(batch_size);
 
     for (int b = 0; b < batch_size; ++b) {
-        auto enc = encoder_out.slice({Slice(b, b + 1)});
+        auto enc = enc_projected.slice({Slice(b, b + 1)});
         int T = (!lengths.empty() && b < static_cast<int>(lengths.size()))
                     ? lengths[b]
                     : seq_len;
@@ -331,8 +337,11 @@ std::vector<std::vector<TimestampedToken>> tdt_beam_decode_with_timestamps(
 
     std::vector<std::vector<TimestampedToken>> results(batch_size);
 
+    // Pre-project all encoder frames once
+    auto enc_projected = joint.project_encoder(encoder_out);
+
     for (int b = 0; b < batch_size; ++b) {
-        auto enc = encoder_out.slice({Slice(b, b + 1)});
+        auto enc = enc_projected.slice({Slice(b, b + 1)});
         int T = (!lengths.empty() && b < static_cast<int>(lengths.size()))
                     ? lengths[b]
                     : seq_len;
