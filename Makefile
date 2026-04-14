@@ -6,6 +6,11 @@ ifdef CLI
     CMAKE_FLAGS += -DPARAKEET_BUILD_CLI=$(CLI)
 endif
 
+# Optional: make build SERVER=ON
+ifdef SERVER
+    CMAKE_FLAGS += -DENABLE_SERVER_EXAMPLE=$(SERVER)
+endif
+
 # Use Ninja if available, otherwise Unix Makefiles
 ifneq ($(shell which ninja 2>/dev/null),)
     GENERATOR    := Ninja
