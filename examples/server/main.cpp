@@ -25,6 +25,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include <sys/socket.h>
@@ -496,10 +497,10 @@ struct WarmTDT600Transcriber final : ServerTranscriber {
             trie.build(options.boost_phrases, tokenizer);
         }
 
-        parakeet::ArpaLM lm;
+        const parakeet::ArpaLM *lm = nullptr;
         if (options.decoder == parakeet::Decoder::TDT_BEAM &&
             !options.lm_path.empty()) {
-            lm.load(options.lm_path);
+            lm = &get_or_load_lm(options.lm_path);
         }
 
         const int blank_id = model_config.prediction.vocab_size - 1;
@@ -511,7 +512,7 @@ struct WarmTDT600Transcriber final : ServerTranscriber {
                 parakeet::TDTBeamSearchOptions beam_options;
                 beam_options.beam_width = options.beam_width;
                 beam_options.blank_id = blank_id;
-                beam_options.lm = lm.loaded() ? &lm : nullptr;
+                beam_options.lm = lm;
                 beam_options.lm_weight = options.lm_weight;
                 beam_options.pieces =
                     tokenizer.loaded() ? &tokenizer.pieces() : nullptr;
@@ -549,7 +550,7 @@ struct WarmTDT600Transcriber final : ServerTranscriber {
             parakeet::TDTBeamSearchOptions beam_options;
             beam_options.beam_width = options.beam_width;
             beam_options.blank_id = blank_id;
-            beam_options.lm = lm.loaded() ? &lm : nullptr;
+            beam_options.lm = lm;
             beam_options.lm_weight = options.lm_weight;
             beam_options.pieces =
                 tokenizer.loaded() ? &tokenizer.pieces() : nullptr;
@@ -572,12 +573,27 @@ struct WarmTDT600Transcriber final : ServerTranscriber {
         return result;
     }
 
+    // Cache ARPA language models by path so the warm process does not reload
+    // them on every request. The server is single-threaded, so no locking.
+    const parakeet::ArpaLM &get_or_load_lm(const std::string &path) {
+        auto it = lm_cache.find(path);
+        if (it != lm_cache.end()) {
+            return it->second;
+        }
+        std::cerr << "loading LM from " << path << "\n";
+        parakeet::ArpaLM lm;
+        lm.load(path);
+        auto inserted = lm_cache.emplace(path, std::move(lm)).first;
+        return inserted->second;
+    }
+
     parakeet::TDTConfig model_config;
     parakeet::ParakeetTDT model;
     parakeet::Tokenizer tokenizer;
     bool use_gpu = false;
     bool use_fp16 = false;
     std::unique_ptr<parakeet::audio::SileroVAD> vad;
+    std::unordered_map<std::string, parakeet::ArpaLM> lm_cache;
 };
 
 std::unique_ptr<ServerTranscriber>

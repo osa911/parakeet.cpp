@@ -17,7 +17,7 @@ make build SERVER=ON
 You can also configure CMake directly:
 
 ```bash
-cmake -B build -DENABLE_SERVER_EXAMPLE=ON
+cmake -B build -DPARAKEET_BUILD_SERVER_EXAMPLE=ON
 cmake --build build
 ```
 

@@ -8,7 +8,7 @@ endif
 
 # Optional: make build SERVER=ON
 ifdef SERVER
-    CMAKE_FLAGS += -DENABLE_SERVER_EXAMPLE=$(SERVER)
+    CMAKE_FLAGS += -DPARAKEET_BUILD_SERVER_EXAMPLE=$(SERVER)
 endif
 
 # Use Ninja if available, otherwise Unix Makefiles
