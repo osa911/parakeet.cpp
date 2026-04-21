@@ -30,6 +30,7 @@ Disable with `-DPARAKEET_BUILD_EXAMPLES=OFF`.
 | [batch](batch/) | Batch transcription of multiple files |
 | [vad](vad/) | Voice activity detection (standalone + ASR preprocessing) |
 | [gpu](gpu/) | Metal GPU acceleration and FP16 with timing comparison |
+| [server](server/) | Warm transcriber daemon over a Unix domain socket (opt-in build) |
 
 ## Streaming
 
