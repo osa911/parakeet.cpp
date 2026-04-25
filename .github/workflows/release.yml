@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. v0.1.0-rc1). Used for artifact names; no GitHub release is created on manual runs.'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            os: macos
+            arch: arm64
+          - runner: macos-13
+            os: macos
+            arch: x86_64
+          - runner: ubuntu-22.04
+            os: linux
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [[ -n "${{ github.event.inputs.version }}" ]]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install macOS deps
+        if: startsWith(matrix.runner, 'macos')
+        run: brew install ninja libomp
+
+      - name: Install Linux deps
+        if: matrix.runner == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build patchelf libopenblas-dev
+
+      - name: Package
+        run: scripts/package_release.sh --version ${{ steps.version.outputs.version }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: parakeet-${{ steps.version.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/parakeet-${{ steps.version.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: package
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.tar.gz
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') }}
