@@ -597,12 +597,14 @@ class TDTTranscriber {
             lm = &get_or_load_lm(opts.lm_path);
         }
 
+        int blank_id = config_.prediction.vocab_size - 1;
         TranscribeResult result;
 
         if (opts.timestamps) {
             if (opts.decoder == Decoder::TDT_BEAM) {
                 TDTBeamSearchOptions bs_opts;
                 bs_opts.beam_width = opts.beam_width;
+                bs_opts.blank_id = blank_id;
                 bs_opts.lm = lm;
                 bs_opts.lm_weight = opts.lm_weight;
                 bs_opts.pieces =
@@ -619,9 +621,10 @@ class TDTTranscriber {
                 auto all_ts = use_boost
                                   ? tdt_greedy_decode_with_timestamps_boosted(
                                         model_, encoder_out, config_.durations,
-                                        trie, opts.boost_score)
+                                        trie, opts.boost_score, blank_id)
                                   : tdt_greedy_decode_with_timestamps(
-                                        model_, encoder_out, config_.durations);
+                                        model_, encoder_out, config_.durations,
+                                        blank_id);
                 if (!all_ts.empty()) {
                     result.timestamped_tokens = all_ts[0];
                     for (const auto &t : result.timestamped_tokens) {
@@ -644,6 +647,7 @@ class TDTTranscriber {
             if (opts.decoder == Decoder::TDT_BEAM) {
                 TDTBeamSearchOptions bs_opts;
                 bs_opts.beam_width = opts.beam_width;
+                bs_opts.blank_id = blank_id;
                 bs_opts.lm = lm;
                 bs_opts.lm_weight = opts.lm_weight;
                 bs_opts.pieces =
@@ -658,12 +662,11 @@ class TDTTranscriber {
                 }
             } else {
                 auto all_tokens =
-                    use_boost
-                        ? tdt_greedy_decode_boosted(model_, encoder_out,
-                                                    config_.durations, trie,
-                                                    opts.boost_score)
-                        : tdt_greedy_decode(model_, encoder_out,
-                                            config_.durations);
+                    use_boost ? tdt_greedy_decode_boosted(
+                                    model_, encoder_out, config_.durations,
+                                    trie, opts.boost_score, blank_id)
+                              : tdt_greedy_decode(model_, encoder_out,
+                                                  config_.durations, blank_id);
                 if (!all_tokens.empty()) {
                     result.token_ids = all_tokens[0];
                     if (tokenizer_.loaded()) {
