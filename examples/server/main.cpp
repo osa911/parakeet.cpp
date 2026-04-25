@@ -25,7 +25,6 @@
 #include <sstream>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <vector>
 
 #include <sys/socket.h>
@@ -430,28 +429,9 @@ struct WarmTranscriber final : ServerTranscriber {
 
 struct WarmTDT600Transcriber final : ServerTranscriber {
     explicit WarmTDT600Transcriber(const ServerConfig &config)
-        : model_config(parakeet::make_tdt_600m_config()), model(model_config) {
-        auto weights = axiom::io::safetensors::load(config.weights_path);
-        model.load_state_dict(weights, "", false);
-        tokenizer.load(config.vocab_path);
-
-        if (config.use_fp16) {
-            model.to(axiom::DType::Float16);
-            use_fp16 = true;
-        }
-        if (config.use_gpu) {
-            model.to(axiom::Device::GPU);
-            use_gpu = true;
-        }
-        if (!config.vad_path.empty()) {
-            vad = std::make_unique<parakeet::audio::SileroVAD>(config.vad_path);
-            if (use_fp16) {
-                vad->to_half();
-            }
-            if (use_gpu) {
-                vad->to_gpu();
-            }
-        }
+        : transcriber(config.weights_path, config.vocab_path,
+                      parakeet::make_tdt_600m_config()) {
+        configure_transcriber(transcriber, config);
     }
 
     parakeet::TranscribeResult transcribe(const Request &request) override {
@@ -459,141 +439,11 @@ struct WarmTDT600Transcriber final : ServerTranscriber {
             throw std::runtime_error("tdt-600m server only supports "
                                      "decoder=\"tdt\" or \"tdt-beam\"");
         }
-
-        auto audio_data = parakeet::read_audio(request.audio_path);
-        auto options = make_options(request);
-
-        axiom::Tensor audio_for_asr = audio_data.samples;
-        std::unique_ptr<parakeet::audio::TimestampRemapper> remapper;
-        if (options.use_vad && vad) {
-            auto segments = vad->detect(audio_data.samples);
-            if (!segments.empty()) {
-                audio_for_asr = parakeet::audio::collect_speech(
-                    audio_data.samples, segments);
-                if (options.timestamps) {
-                    remapper =
-                        std::make_unique<parakeet::audio::TimestampRemapper>(
-                            segments);
-                }
-            }
-        }
-
-        parakeet::AudioConfig audio_cfg;
-        audio_cfg.n_mels = model_config.encoder.mel_bins;
-        auto features = parakeet::preprocess_audio(audio_for_asr, audio_cfg);
-        if (use_fp16) {
-            features = features.half();
-        }
-        if (use_gpu) {
-            features = features.gpu();
-        }
-
-        auto encoder_out = model.encoder()(features);
-
-        parakeet::ContextTrie trie;
-        const bool use_boost =
-            !options.boost_phrases.empty() && tokenizer.loaded();
-        if (use_boost) {
-            trie.build(options.boost_phrases, tokenizer);
-        }
-
-        const parakeet::ArpaLM *lm = nullptr;
-        if (options.decoder == parakeet::Decoder::TDT_BEAM &&
-            !options.lm_path.empty()) {
-            lm = &get_or_load_lm(options.lm_path);
-        }
-
-        const int blank_id = model_config.prediction.vocab_size - 1;
-        parakeet::TranscribeResult result;
-
-        if (options.timestamps) {
-            std::vector<std::vector<parakeet::TimestampedToken>> all_tokens;
-            if (options.decoder == parakeet::Decoder::TDT_BEAM) {
-                parakeet::TDTBeamSearchOptions beam_options;
-                beam_options.beam_width = options.beam_width;
-                beam_options.blank_id = blank_id;
-                beam_options.lm = lm;
-                beam_options.lm_weight = options.lm_weight;
-                beam_options.pieces =
-                    tokenizer.loaded() ? &tokenizer.pieces() : nullptr;
-                all_tokens = parakeet::tdt_beam_decode_with_timestamps(
-                    model, encoder_out, model_config.durations, beam_options);
-            } else {
-                all_tokens =
-                    use_boost
-                        ? parakeet::tdt_greedy_decode_with_timestamps_boosted(
-                              model, encoder_out, model_config.durations, trie,
-                              options.boost_score, blank_id)
-                        : parakeet::tdt_greedy_decode_with_timestamps(
-                              model, encoder_out, model_config.durations,
-                              blank_id);
-            }
-
-            if (!all_tokens.empty()) {
-                result.timestamped_tokens = all_tokens[0];
-                if (remapper) {
-                    result.timestamped_tokens =
-                        remapper->remap_tokens(result.timestamped_tokens);
-                }
-                for (const auto &token : result.timestamped_tokens) {
-                    result.token_ids.push_back(token.token_id);
-                }
-                result.text = tokenizer.decode(result.token_ids);
-                result.word_timestamps = parakeet::group_timestamps(
-                    result.timestamped_tokens, tokenizer.pieces());
-            }
-            return result;
-        }
-
-        std::vector<std::vector<int>> all_tokens;
-        if (options.decoder == parakeet::Decoder::TDT_BEAM) {
-            parakeet::TDTBeamSearchOptions beam_options;
-            beam_options.beam_width = options.beam_width;
-            beam_options.blank_id = blank_id;
-            beam_options.lm = lm;
-            beam_options.lm_weight = options.lm_weight;
-            beam_options.pieces =
-                tokenizer.loaded() ? &tokenizer.pieces() : nullptr;
-            all_tokens = parakeet::tdt_beam_decode(
-                model, encoder_out, model_config.durations, beam_options);
-        } else {
-            all_tokens =
-                use_boost ? parakeet::tdt_greedy_decode_boosted(
-                                model, encoder_out, model_config.durations,
-                                trie, options.boost_score, blank_id)
-                          : parakeet::tdt_greedy_decode(model, encoder_out,
-                                                        model_config.durations,
-                                                        blank_id);
-        }
-
-        if (!all_tokens.empty()) {
-            result.token_ids = all_tokens[0];
-            result.text = tokenizer.decode(result.token_ids);
-        }
-        return result;
+        return transcriber.transcribe(request.audio_path,
+                                      make_options(request));
     }
 
-    // Cache ARPA language models by path so the warm process does not reload
-    // them on every request. The server is single-threaded, so no locking.
-    const parakeet::ArpaLM &get_or_load_lm(const std::string &path) {
-        auto it = lm_cache.find(path);
-        if (it != lm_cache.end()) {
-            return it->second;
-        }
-        std::cerr << "loading LM from " << path << "\n";
-        parakeet::ArpaLM lm;
-        lm.load(path);
-        auto inserted = lm_cache.emplace(path, std::move(lm)).first;
-        return inserted->second;
-    }
-
-    parakeet::TDTConfig model_config;
-    parakeet::ParakeetTDT model;
-    parakeet::Tokenizer tokenizer;
-    bool use_gpu = false;
-    bool use_fp16 = false;
-    std::unique_ptr<parakeet::audio::SileroVAD> vad;
-    std::unordered_map<std::string, parakeet::ArpaLM> lm_cache;
+    parakeet::TDTTranscriber transcriber;
 };
 
 std::unique_ptr<ServerTranscriber>
