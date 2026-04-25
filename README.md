@@ -49,7 +49,21 @@ std::cout << result.text << std::endl;
 
 See [examples/](examples/) for code demonstrating each feature.
 
-## Build
+## Install
+
+Prebuilt binaries are attached to each [GitHub release](https://github.com/Frikallo/parakeet.cpp/releases) for macOS arm64, macOS x86_64, and Linux x86_64. Download the tarball for your platform and extract:
+
+```bash
+tar -xzf parakeet-v0.1.0-macos-arm64.tar.gz
+cd parakeet-v0.1.0-macos-arm64
+# On macOS, clear the Gatekeeper quarantine attribute first:
+xattr -dr com.apple.quarantine .
+./bin/parakeet --help
+```
+
+The archive ships a self-contained `bin/parakeet` (and `bin/example-server`) plus `lib/libaxiom` with `@rpath`/`$ORIGIN` set so the binaries resolve their dependencies relative to the install dir — drop the directory anywhere. The C-API headers under `include/parakeet/` are included for embedders.
+
+## Build from source
 
 ```bash
 git clone --recursive https://github.com/frikallo/parakeet.cpp
@@ -59,6 +73,8 @@ make test
 ```
 
 Requirements: C++20 (Clang 14+ or GCC 12+), CMake 3.20+, macOS 13+ for Metal GPU.
+
+> **macOS:** building requires the **full Xcode** install (not just Command Line Tools), because axiom compiles its Metal shaders with `xcrun metal` and `xcrun metallib` — those ship only with Xcode. If you just want to run parakeet, use the prebuilt tarball above; the `.metallib` is embedded into the shipped `libaxiom.dylib` and runs without any Xcode/CLT install on the user side.
 
 ## Convert Weights
 
