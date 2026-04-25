@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <axiom/axiom.hpp>
@@ -153,12 +154,12 @@ class Transcriber {
             trie.build(opts.boost_phrases, tokenizer_);
         }
 
-        // Load LM if beam search with LM requested
-        ArpaLM lm;
+        // Look up LM in cache if beam search with LM requested.
+        const ArpaLM *lm = nullptr;
         if ((opts.decoder == Decoder::CTC_BEAM ||
              opts.decoder == Decoder::TDT_BEAM) &&
             !opts.lm_path.empty()) {
-            lm.load(opts.lm_path);
+            lm = &get_or_load_lm(opts.lm_path);
         }
 
         TranscribeResult result;
@@ -167,7 +168,7 @@ class Transcriber {
             if (opts.decoder == Decoder::TDT_BEAM) {
                 TDTBeamSearchOptions bs_opts;
                 bs_opts.beam_width = opts.beam_width;
-                bs_opts.lm = lm.loaded() ? &lm : nullptr;
+                bs_opts.lm = lm;
                 bs_opts.lm_weight = opts.lm_weight;
                 bs_opts.pieces =
                     tokenizer_.loaded() ? &tokenizer_.pieces() : nullptr;
@@ -184,7 +185,7 @@ class Transcriber {
                 auto cpu_lp = log_probs.cpu();
                 BeamSearchOptions bs_opts;
                 bs_opts.beam_width = opts.beam_width;
-                bs_opts.lm = lm.loaded() ? &lm : nullptr;
+                bs_opts.lm = lm;
                 bs_opts.lm_weight = opts.lm_weight;
                 bs_opts.pieces =
                     tokenizer_.loaded() ? &tokenizer_.pieces() : nullptr;
@@ -239,7 +240,7 @@ class Transcriber {
             if (opts.decoder == Decoder::TDT_BEAM) {
                 TDTBeamSearchOptions bs_opts;
                 bs_opts.beam_width = opts.beam_width;
-                bs_opts.lm = lm.loaded() ? &lm : nullptr;
+                bs_opts.lm = lm;
                 bs_opts.lm_weight = opts.lm_weight;
                 bs_opts.pieces =
                     tokenizer_.loaded() ? &tokenizer_.pieces() : nullptr;
@@ -250,7 +251,7 @@ class Transcriber {
                 auto cpu_lp = log_probs.cpu();
                 BeamSearchOptions bs_opts;
                 bs_opts.beam_width = opts.beam_width;
-                bs_opts.lm = lm.loaded() ? &lm : nullptr;
+                bs_opts.lm = lm;
                 bs_opts.lm_weight = opts.lm_weight;
                 bs_opts.pieces =
                     tokenizer_.loaded() ? &tokenizer_.pieces() : nullptr;
@@ -339,12 +340,12 @@ class Transcriber {
             trie.build(opts.boost_phrases, tokenizer_);
         }
 
-        // Load LM if beam search with LM requested
-        ArpaLM batch_lm;
+        // Look up LM in cache if beam search with LM requested.
+        const ArpaLM *batch_lm = nullptr;
         if ((opts.decoder == Decoder::CTC_BEAM ||
              opts.decoder == Decoder::TDT_BEAM) &&
             !opts.lm_path.empty()) {
-            batch_lm.load(opts.lm_path);
+            batch_lm = &get_or_load_lm(opts.lm_path);
         }
 
         std::vector<TranscribeResult> results(samples.size());
@@ -353,7 +354,7 @@ class Transcriber {
             if (opts.decoder == Decoder::TDT_BEAM) {
                 TDTBeamSearchOptions bs_opts;
                 bs_opts.beam_width = opts.beam_width;
-                bs_opts.lm = batch_lm.loaded() ? &batch_lm : nullptr;
+                bs_opts.lm = batch_lm;
                 bs_opts.lm_weight = opts.lm_weight;
                 bs_opts.pieces =
                     tokenizer_.loaded() ? &tokenizer_.pieces() : nullptr;
@@ -370,7 +371,7 @@ class Transcriber {
                 auto cpu_lp = log_probs.cpu();
                 BeamSearchOptions bs_opts;
                 bs_opts.beam_width = opts.beam_width;
-                bs_opts.lm = batch_lm.loaded() ? &batch_lm : nullptr;
+                bs_opts.lm = batch_lm;
                 bs_opts.lm_weight = opts.lm_weight;
                 bs_opts.pieces =
                     tokenizer_.loaded() ? &tokenizer_.pieces() : nullptr;
@@ -422,7 +423,7 @@ class Transcriber {
             if (opts.decoder == Decoder::TDT_BEAM) {
                 TDTBeamSearchOptions bs_opts;
                 bs_opts.beam_width = opts.beam_width;
-                bs_opts.lm = batch_lm.loaded() ? &batch_lm : nullptr;
+                bs_opts.lm = batch_lm;
                 bs_opts.lm_weight = opts.lm_weight;
                 bs_opts.pieces =
                     tokenizer_.loaded() ? &tokenizer_.pieces() : nullptr;
@@ -434,7 +435,7 @@ class Transcriber {
                 auto cpu_lp = log_probs.cpu();
                 BeamSearchOptions bs_opts;
                 bs_opts.beam_width = opts.beam_width;
-                bs_opts.lm = batch_lm.loaded() ? &batch_lm : nullptr;
+                bs_opts.lm = batch_lm;
                 bs_opts.lm_weight = opts.lm_weight;
                 bs_opts.pieces =
                     tokenizer_.loaded() ? &tokenizer_.pieces() : nullptr;
@@ -481,13 +482,30 @@ class Transcriber {
     ParakeetTDTCTC &model() { return model_; }
     const Tokenizer &tokenizer() const { return tokenizer_; }
 
+    /// Drop any cached ARPA language models. Useful if a path's contents
+    /// changed on disk or to reclaim memory.
+    void clear_lm_cache() { lm_cache_.clear(); }
+
   private:
+    // Cache ARPA language models by path so repeated transcribe() calls do
+    // not pay the full ARPA load cost every time. Not thread-safe — wrap
+    // externally if calling transcribe() concurrently from multiple threads.
+    const ArpaLM &get_or_load_lm(const std::string &path) {
+        auto it = lm_cache_.find(path);
+        if (it != lm_cache_.end())
+            return it->second;
+        ArpaLM lm;
+        lm.load(path);
+        return lm_cache_.emplace(path, std::move(lm)).first->second;
+    }
+
     TDTCTCConfig config_;
     ParakeetTDTCTC model_;
     Tokenizer tokenizer_;
     bool use_gpu_ = false;
     bool use_fp16_ = false;
     std::unique_ptr<audio::SileroVAD> vad_;
+    std::unordered_map<std::string, ArpaLM> lm_cache_;
 };
 
 // ─── TDT-Only Transcriber (for 600M multilingual etc.) ─────────────────────
@@ -573,19 +591,21 @@ class TDTTranscriber {
             trie.build(opts.boost_phrases, tokenizer_);
         }
 
-        // Load LM if beam search with LM requested
-        ArpaLM lm;
+        // Look up LM in cache if beam search with LM requested.
+        const ArpaLM *lm = nullptr;
         if (opts.decoder == Decoder::TDT_BEAM && !opts.lm_path.empty()) {
-            lm.load(opts.lm_path);
+            lm = &get_or_load_lm(opts.lm_path);
         }
 
+        int blank_id = config_.prediction.vocab_size - 1;
         TranscribeResult result;
 
         if (opts.timestamps) {
             if (opts.decoder == Decoder::TDT_BEAM) {
                 TDTBeamSearchOptions bs_opts;
                 bs_opts.beam_width = opts.beam_width;
-                bs_opts.lm = lm.loaded() ? &lm : nullptr;
+                bs_opts.blank_id = blank_id;
+                bs_opts.lm = lm;
                 bs_opts.lm_weight = opts.lm_weight;
                 bs_opts.pieces =
                     tokenizer_.loaded() ? &tokenizer_.pieces() : nullptr;
@@ -601,9 +621,10 @@ class TDTTranscriber {
                 auto all_ts = use_boost
                                   ? tdt_greedy_decode_with_timestamps_boosted(
                                         model_, encoder_out, config_.durations,
-                                        trie, opts.boost_score)
+                                        trie, opts.boost_score, blank_id)
                                   : tdt_greedy_decode_with_timestamps(
-                                        model_, encoder_out, config_.durations);
+                                        model_, encoder_out, config_.durations,
+                                        blank_id);
                 if (!all_ts.empty()) {
                     result.timestamped_tokens = all_ts[0];
                     for (const auto &t : result.timestamped_tokens) {
@@ -626,7 +647,8 @@ class TDTTranscriber {
             if (opts.decoder == Decoder::TDT_BEAM) {
                 TDTBeamSearchOptions bs_opts;
                 bs_opts.beam_width = opts.beam_width;
-                bs_opts.lm = lm.loaded() ? &lm : nullptr;
+                bs_opts.blank_id = blank_id;
+                bs_opts.lm = lm;
                 bs_opts.lm_weight = opts.lm_weight;
                 bs_opts.pieces =
                     tokenizer_.loaded() ? &tokenizer_.pieces() : nullptr;
@@ -640,12 +662,11 @@ class TDTTranscriber {
                 }
             } else {
                 auto all_tokens =
-                    use_boost
-                        ? tdt_greedy_decode_boosted(model_, encoder_out,
-                                                    config_.durations, trie,
-                                                    opts.boost_score)
-                        : tdt_greedy_decode(model_, encoder_out,
-                                            config_.durations);
+                    use_boost ? tdt_greedy_decode_boosted(
+                                    model_, encoder_out, config_.durations,
+                                    trie, opts.boost_score, blank_id)
+                              : tdt_greedy_decode(model_, encoder_out,
+                                                  config_.durations, blank_id);
                 if (!all_tokens.empty()) {
                     result.token_ids = all_tokens[0];
                     if (tokenizer_.loaded()) {
@@ -715,10 +736,10 @@ class TDTTranscriber {
             trie.build(opts.boost_phrases, tokenizer_);
         }
 
-        // Load LM if beam search with LM requested
-        ArpaLM batch_lm;
+        // Look up LM in cache if beam search with LM requested.
+        const ArpaLM *batch_lm = nullptr;
         if (opts.decoder == Decoder::TDT_BEAM && !opts.lm_path.empty()) {
-            batch_lm.load(opts.lm_path);
+            batch_lm = &get_or_load_lm(opts.lm_path);
         }
 
         int blank_id = config_.prediction.vocab_size - 1;
@@ -729,7 +750,7 @@ class TDTTranscriber {
                 TDTBeamSearchOptions bs_opts;
                 bs_opts.beam_width = opts.beam_width;
                 bs_opts.blank_id = blank_id;
-                bs_opts.lm = batch_lm.loaded() ? &batch_lm : nullptr;
+                bs_opts.lm = batch_lm;
                 bs_opts.lm_weight = opts.lm_weight;
                 bs_opts.pieces =
                     tokenizer_.loaded() ? &tokenizer_.pieces() : nullptr;
@@ -769,7 +790,7 @@ class TDTTranscriber {
                 TDTBeamSearchOptions bs_opts;
                 bs_opts.beam_width = opts.beam_width;
                 bs_opts.blank_id = blank_id;
-                bs_opts.lm = batch_lm.loaded() ? &batch_lm : nullptr;
+                bs_opts.lm = batch_lm;
                 bs_opts.lm_weight = opts.lm_weight;
                 bs_opts.pieces =
                     tokenizer_.loaded() ? &tokenizer_.pieces() : nullptr;
@@ -809,13 +830,30 @@ class TDTTranscriber {
     ParakeetTDT &model() { return model_; }
     const Tokenizer &tokenizer() const { return tokenizer_; }
 
+    /// Drop any cached ARPA language models. Useful if a path's contents
+    /// changed on disk or to reclaim memory.
+    void clear_lm_cache() { lm_cache_.clear(); }
+
   private:
+    // Cache ARPA language models by path so repeated transcribe() calls do
+    // not pay the full ARPA load cost every time. Not thread-safe — wrap
+    // externally if calling transcribe() concurrently from multiple threads.
+    const ArpaLM &get_or_load_lm(const std::string &path) {
+        auto it = lm_cache_.find(path);
+        if (it != lm_cache_.end())
+            return it->second;
+        ArpaLM lm;
+        lm.load(path);
+        return lm_cache_.emplace(path, std::move(lm)).first->second;
+    }
+
     TDTConfig config_;
     ParakeetTDT model_;
     Tokenizer tokenizer_;
     bool use_gpu_ = false;
     bool use_fp16_ = false;
     std::unique_ptr<audio::SileroVAD> vad_;
+    std::unordered_map<std::string, ArpaLM> lm_cache_;
 };
 
 // ─── Streaming Transcriber ───────────────────────────────────────────────────
