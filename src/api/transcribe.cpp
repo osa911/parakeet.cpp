@@ -2,6 +2,8 @@
 
 #include <axiom/io/safetensors.hpp>
 
+#include <vector>
+
 namespace parakeet::api {
 
 // ─── StreamingTranscriber ────────────────────────────────────────────────────
@@ -62,6 +64,20 @@ void StreamingTranscriber::reset() {
     preprocessor_.reset();
     encoder_cache_ = EncoderCache{};
     decode_state_ = StreamingDecodeState{};
+    text_delta_offset_ = 0;
+}
+
+void StreamingTranscriber::reset_decoder() {
+    decode_state_ = StreamingDecodeState{};
+    text_delta_offset_ = 0;
+}
+
+std::string StreamingTranscriber::finalize(int pad_samples) {
+    if (pad_samples > 0) {
+        std::vector<float> pad(static_cast<size_t>(pad_samples), 0.0f);
+        transcribe_chunk(pad.data(), pad.size());
+    }
+    return get_text();
 }
 
 std::string StreamingTranscriber::get_text() const {
@@ -69,6 +85,14 @@ std::string StreamingTranscriber::get_text() const {
         return tokenizer_.decode(decode_state_.tokens);
     }
     return "";
+}
+
+std::string StreamingTranscriber::get_text_delta() {
+    auto full = get_text();
+    if (full.size() <= text_delta_offset_) return "";
+    auto d = full.substr(text_delta_offset_);
+    text_delta_offset_ = full.size();
+    return d;
 }
 
 // ─── NemotronTranscriber ─────────────────────────────────────────────────────
@@ -125,6 +149,20 @@ void NemotronTranscriber::reset() {
     preprocessor_.reset();
     encoder_cache_ = EncoderCache{};
     decode_state_ = StreamingDecodeState{};
+    text_delta_offset_ = 0;
+}
+
+void NemotronTranscriber::reset_decoder() {
+    decode_state_ = StreamingDecodeState{};
+    text_delta_offset_ = 0;
+}
+
+std::string NemotronTranscriber::finalize(int pad_samples) {
+    if (pad_samples > 0) {
+        std::vector<float> pad(static_cast<size_t>(pad_samples), 0.0f);
+        transcribe_chunk(pad.data(), pad.size());
+    }
+    return get_text();
 }
 
 std::string NemotronTranscriber::get_text() const {
@@ -132,6 +170,14 @@ std::string NemotronTranscriber::get_text() const {
         return tokenizer_.decode(decode_state_.tokens);
     }
     return "";
+}
+
+std::string NemotronTranscriber::get_text_delta() {
+    auto full = get_text();
+    if (full.size() <= text_delta_offset_) return "";
+    auto d = full.substr(text_delta_offset_);
+    text_delta_offset_ = full.size();
+    return d;
 }
 
 } // namespace parakeet::api

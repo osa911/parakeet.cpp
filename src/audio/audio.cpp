@@ -292,24 +292,35 @@ Tensor StreamingAudioPreprocessor::process_chunk(const Tensor &samples) {
                      overlap_buffer_.end());
     audio_buf.insert(audio_buf.end(), pre.begin(), pre.end());
 
-    // Calculate how many complete frames we can produce
+    // Calculate how many complete frames we can produce. STFT with
+    // center=false frames the signal in n_fft-sized windows, not win_length —
+    // win_length is just the size of the window function, which axiom::stft
+    // zero-pads up to n_fft when it's smaller. So the framing math must use
+    // n_fft as the frame span.
     int total_samples = static_cast<int>(audio_buf.size());
-    if (total_samples < config_.win_length) {
+    if (total_samples < config_.n_fft) {
         // Not enough for even one frame — buffer everything
         overlap_buffer_ = std::move(audio_buf);
         return Tensor();
     }
 
     int n_frames =
-        (total_samples - config_.win_length) / config_.hop_length + 1;
+        (total_samples - config_.n_fft) / config_.hop_length + 1;
     if (n_frames <= 0) {
         overlap_buffer_ = std::move(audio_buf);
         return Tensor();
     }
 
-    // Save overlap for next chunk
-    int consumed = (n_frames - 1) * config_.hop_length + config_.win_length;
-    overlap_buffer_.assign(audio_buf.begin() + consumed, audio_buf.end());
+    // The samples this call consumes for STFT (covers all n_frames windows).
+    int consumed = (n_frames - 1) * config_.hop_length + config_.n_fft;
+    // The next chunk's first frame starts at n_frames * hop_length. Anything
+    // from there to end must carry over as overlap — note this is BEFORE
+    // `consumed` whenever n_fft > hop_length (always for sensible configs),
+    // so the overlap range is shared between this chunk's last frames and
+    // the next chunk's first frames.
+    int next_frame_start = n_frames * config_.hop_length;
+    overlap_buffer_.assign(audio_buf.begin() + next_frame_start,
+                           audio_buf.end());
 
     // 3. STFT on the consumable portion
     auto audio_tensor = Tensor::from_data(

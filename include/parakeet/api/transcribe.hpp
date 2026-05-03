@@ -898,7 +898,14 @@ class StreamingTranscriber {
     }
 
     // Process a chunk of raw audio samples.
-    // Returns any new text produced by this chunk.
+    //
+    // Returns the text decoded from the new tokens emitted by this chunk.
+    // Note: this string is the result of detokenizing only this chunk's
+    // tokens; subword spacing markers (e.g. SentencePiece's leading ▁) can
+    // be lost when a chunk boundary falls mid-word, producing concatenation
+    // artifacts ("isnoah" instead of "is noah") if you accumulate these
+    // returns yourself. For canonical text prefer `get_text()` (full
+    // transcript) or `get_text_delta()` (incremental, properly spaced).
     std::string transcribe_chunk(const axiom::Tensor &samples);
 
     // Convenience: process raw float32 PCM buffer.
@@ -918,8 +925,25 @@ class StreamingTranscriber {
         return transcribe_chunk(t);
     }
 
-    // Reset state for a new utterance.
+    // Reset state for a new utterance (preprocessor, encoder cache, decoder).
     void reset();
+
+    // Reset only the decoder state (token history, predictor LSTM state).
+    // Preserves the encoder cache and audio preprocessor overlap so the next
+    // chunk sees the same acoustic context as if no reset had occurred.
+    // Useful for continuous transcription with utterance boundaries: you get
+    // a clean decoding start per utterance without losing the encoder's
+    // cross-utterance context.
+    void reset_decoder();
+
+    // Drain any audio held in the streaming preprocessor's overlap buffer
+    // and the encoder's lookahead cache by feeding `pad_samples` of zeros,
+    // then return the full transcript so far. Does NOT call reset() — to
+    // start a new utterance afterward call reset() or reset_decoder()
+    // explicitly. Default 1s of pad covers chunk_size + att_context_right
+    // for all current configs; pass a larger value if you stack heavy
+    // lookahead.
+    std::string finalize(int pad_samples = 16000);
 
     // Set callback for partial results (called each time new tokens are
     // emitted).
@@ -929,6 +953,12 @@ class StreamingTranscriber {
 
     // Get full transcription so far.
     std::string get_text() const;
+
+    // Get the portion of get_text() emitted since the last call to
+    // get_text_delta() (or since the last reset / reset_decoder). Always
+    // properly spaced — does the slicing on the canonical full-sequence
+    // detokenize so subword boundary markers survive.
+    std::string get_text_delta();
 
     // Get accumulated timestamped tokens across all chunks.
     const std::vector<TimestampedToken> &get_timestamped_tokens() const {
@@ -948,6 +978,7 @@ class StreamingTranscriber {
     bool use_gpu_ = false;
     bool use_fp16_ = false;
     PartialResultCallback partial_callback_;
+    size_t text_delta_offset_ = 0;
 };
 
 // ─── Nemotron Streaming Transcriber ──────────────────────────────────────────
@@ -968,7 +999,12 @@ class NemotronTranscriber {
         use_fp16_ = true;
     }
 
-    // Process a chunk of raw audio → returns new text from this chunk
+    // Process a chunk of raw audio.
+    //
+    // Returns the text decoded from the new tokens emitted by this chunk.
+    // Note: subword spacing markers can be lost when a chunk boundary falls
+    // mid-word; for canonical, properly spaced text prefer `get_text()` or
+    // `get_text_delta()`.
     std::string transcribe_chunk(const axiom::Tensor &samples);
 
     // Convenience: process raw float32 PCM buffer.
@@ -988,11 +1024,25 @@ class NemotronTranscriber {
         return transcribe_chunk(t);
     }
 
-    // Reset for a new utterance
+    // Reset for a new utterance (preprocessor, encoder cache, decoder).
     void reset();
+
+    // Reset only the decoder state (token history, predictor LSTM state).
+    // Preserves the encoder cache and audio preprocessor overlap so cross-
+    // utterance acoustic context is retained.
+    void reset_decoder();
+
+    // Drain any audio held in the streaming preprocessor and encoder
+    // lookahead cache by feeding `pad_samples` of zeros, then return the
+    // full transcript so far. Does NOT call reset().
+    std::string finalize(int pad_samples = 16000);
 
     // Get full transcription so far
     std::string get_text() const;
+
+    // Get the portion of get_text() emitted since the last call to
+    // get_text_delta() (or since the last reset / reset_decoder).
+    std::string get_text_delta();
 
     void set_partial_callback(PartialResultCallback cb) {
         partial_callback_ = std::move(cb);
@@ -1015,6 +1065,7 @@ class NemotronTranscriber {
     bool use_gpu_ = false;
     bool use_fp16_ = false;
     PartialResultCallback partial_callback_;
+    size_t text_delta_offset_ = 0;
 };
 
 } // namespace parakeet::api

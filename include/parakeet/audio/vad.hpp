@@ -49,6 +49,15 @@ class SileroVAD {
                                       const VADConfig &config = {});
 
     /// Process a single chunk (streaming). Returns speech probability.
+    ///
+    /// Chunks are coerced to the model's native window
+    /// (`model.config().num_samples`, 512 samples for Silero v5 at 16 kHz)
+    /// before inference: shorter chunks are zero-padded on the right,
+    /// longer chunks are truncated to the first `num_samples`. For
+    /// best-quality probabilities frame your input at exactly 512 samples
+    /// (32 ms). Note that truncation discards trailing audio — passing a
+    /// 1024-sample chunk yields one probability for the first 512 samples,
+    /// not two probabilities.
     float process_chunk(const axiom::Tensor &chunk, int sample_rate = 16000);
 
     /// Reset streaming state.
