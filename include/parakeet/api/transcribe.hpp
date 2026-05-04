@@ -908,6 +908,16 @@ class StreamingTranscriber {
     // transcript) or `get_text_delta()` (incremental, properly spaced).
     std::string transcribe_chunk(const axiom::Tensor &samples);
 
+    // Process a chunk of pre-computed mel features, bypassing the streaming
+    // audio preprocessor. Use this when multiple transcribers share a
+    // single preprocessor to avoid duplicating STFT + mel work.
+    //
+    // `features` must have shape (1, n_frames, n_mels) matching this
+    // transcriber's encoder config. The transcriber's own preprocessor
+    // overlap state is NOT updated; if you mix this entry point with the
+    // raw-audio entry point, expect inconsistent results.
+    std::string transcribe_chunk_features(const axiom::Tensor &features);
+
     // Convenience: process raw float32 PCM buffer.
     std::string transcribe_chunk(const float *data, size_t num_samples) {
         auto t =
@@ -945,6 +955,12 @@ class StreamingTranscriber {
     // lookahead.
     std::string finalize(int pad_samples = 16000);
 
+    // Run a chunk of zeros through the encoder to populate the K/V caches
+    // before real audio arrives. Pays a one-time inference cost up front so
+    // the first real chunk after construction (or after reset()) doesn't
+    // run cold. No-op if called when state is already populated.
+    void prime_with_silence(int samples = 8000);
+
     // Set callback for partial results (called each time new tokens are
     // emitted).
     void set_partial_callback(PartialResultCallback cb) {
@@ -959,6 +975,12 @@ class StreamingTranscriber {
     // properly spaced — does the slicing on the canonical full-sequence
     // detokenize so subword boundary markers survive.
     std::string get_text_delta();
+
+    // Highest joint-network log-probability assigned to the EOU token
+    // across frames in the most recent transcribe_chunk call. Lets callers
+    // react to "model wants to commit EOU" before the decoder actually
+    // commits. Returns -inf for models without an EOU token (NemotronTranscriber).
+    float last_eou_score() const { return decode_state_.last_tracked_score; }
 
     // Get accumulated timestamped tokens across all chunks.
     const std::vector<TimestampedToken> &get_timestamped_tokens() const {
@@ -1007,6 +1029,11 @@ class NemotronTranscriber {
     // `get_text_delta()`.
     std::string transcribe_chunk(const axiom::Tensor &samples);
 
+    // Process a chunk of pre-computed mel features (bypasses preprocessor).
+    // See StreamingTranscriber for the same caveat about not mixing entry
+    // points.
+    std::string transcribe_chunk_features(const axiom::Tensor &features);
+
     // Convenience: process raw float32 PCM buffer.
     std::string transcribe_chunk(const float *data, size_t num_samples) {
         auto t =
@@ -1036,6 +1063,10 @@ class NemotronTranscriber {
     // lookahead cache by feeding `pad_samples` of zeros, then return the
     // full transcript so far. Does NOT call reset().
     std::string finalize(int pad_samples = 16000);
+
+    // Run a chunk of zeros through the encoder to populate the K/V caches
+    // before real audio arrives. See StreamingTranscriber::prime_with_silence.
+    void prime_with_silence(int samples = 8000);
 
     // Get full transcription so far
     std::string get_text() const;

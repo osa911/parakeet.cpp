@@ -24,31 +24,30 @@ StreamingTranscriber::StreamingTranscriber(const std::string &weights_path,
 
 std::string
 StreamingTranscriber::transcribe_chunk(const axiom::Tensor &samples) {
-    // 1. Preprocess chunk
     auto features = preprocessor_.process_chunk(samples);
     if (!features.storage()) {
         return ""; // not enough samples yet
     }
+    return transcribe_chunk_features(features);
+}
 
-    if (use_fp16_)
-        features = features.half();
-    if (use_gpu_) {
-        features = features.gpu();
-    }
+std::string
+StreamingTranscriber::transcribe_chunk_features(const axiom::Tensor &features) {
+    auto feats = features;
+    if (use_fp16_) feats = feats.half();
+    if (use_gpu_) feats = feats.gpu();
 
-    // 2. Encode chunk
-    auto encoder_out = model_.encoder().forward_chunk(features, encoder_cache_);
+    auto encoder_out = model_.encoder().forward_chunk(feats, encoder_cache_);
     if (!encoder_out.storage()) {
         return ""; // not enough frames for subsampling
     }
 
-    // 3. Decode chunk (blank = last token in vocab)
     int blank_id = config_.joint.vocab_size - 1;
     auto new_tokens = rnnt_streaming_decode_chunk(
         model_.prediction(), model_.joint(), encoder_out, config_.durations,
-        decode_state_, blank_id);
+        decode_state_, blank_id, /*max_symbols_per_step=*/10,
+        /*tracked_token_id=*/config_.eou_token_id);
 
-    // 4. Convert new tokens to text
     if (!new_tokens.empty() && tokenizer_.loaded()) {
         auto text = tokenizer_.decode(new_tokens);
         if (partial_callback_) {
@@ -78,6 +77,16 @@ std::string StreamingTranscriber::finalize(int pad_samples) {
         transcribe_chunk(pad.data(), pad.size());
     }
     return get_text();
+}
+
+void StreamingTranscriber::prime_with_silence(int samples) {
+    if (samples <= 0) return;
+    if (!encoder_cache_.empty()) return; // already warm
+    std::vector<float> pad(static_cast<size_t>(samples), 0.0f);
+    transcribe_chunk(pad.data(), pad.size());
+    // Discard whatever was decoded — this was a warm-up, not real audio.
+    decode_state_ = StreamingDecodeState{};
+    text_delta_offset_ = 0;
 }
 
 std::string StreamingTranscriber::get_text() const {
@@ -117,14 +126,16 @@ NemotronTranscriber::transcribe_chunk(const axiom::Tensor &samples) {
     if (!features.storage()) {
         return "";
     }
+    return transcribe_chunk_features(features);
+}
 
-    if (use_fp16_)
-        features = features.half();
-    if (use_gpu_) {
-        features = features.gpu();
-    }
+std::string
+NemotronTranscriber::transcribe_chunk_features(const axiom::Tensor &features) {
+    auto feats = features;
+    if (use_fp16_) feats = feats.half();
+    if (use_gpu_) feats = feats.gpu();
 
-    auto encoder_out = model_.encoder().forward_chunk(features, encoder_cache_);
+    auto encoder_out = model_.encoder().forward_chunk(feats, encoder_cache_);
     if (!encoder_out.storage()) {
         return "";
     }
@@ -163,6 +174,15 @@ std::string NemotronTranscriber::finalize(int pad_samples) {
         transcribe_chunk(pad.data(), pad.size());
     }
     return get_text();
+}
+
+void NemotronTranscriber::prime_with_silence(int samples) {
+    if (samples <= 0) return;
+    if (!encoder_cache_.empty()) return;
+    std::vector<float> pad(static_cast<size_t>(samples), 0.0f);
+    transcribe_chunk(pad.data(), pad.size());
+    decode_state_ = StreamingDecodeState{};
+    text_delta_offset_ = 0;
 }
 
 std::string NemotronTranscriber::get_text() const {

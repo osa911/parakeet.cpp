@@ -93,6 +93,13 @@ if(PARAKEET_BUILD_CLI)
 endif()
 
 # ── Install rules ────────────────────────────────────────────────────────────
+# Gated behind PARAKEET_INSTALL so downstream consumers that vendor
+# parakeet into a single-archive distribution can disable install rules
+# (otherwise install(EXPORT ...) requires axiom + ggml etc. to be in
+# export sets, which they aren't when bundled).
+option(PARAKEET_INSTALL "Generate install rules for parakeet" ON)
+
+if(PARAKEET_INSTALL)
 install(TARGETS parakeet_lib
     EXPORT ParakeetTargets
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -142,6 +149,8 @@ if(UNIX)
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
     )
 endif()
+
+endif() # PARAKEET_INSTALL
 
 # ── Tests ────────────────────────────────────────────────────────────────────
 if(PARAKEET_BUILD_TESTS)

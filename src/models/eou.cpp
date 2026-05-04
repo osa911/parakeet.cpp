@@ -17,7 +17,8 @@ ParakeetEOU::ParakeetEOU(const EOUConfig &config)
 std::vector<int> rnnt_streaming_decode_chunk(
     RNNTPrediction &prediction, TDTJoint &joint, const Tensor &encoder_chunk,
     const std::vector<int> &durations, StreamingDecodeState &state,
-    int blank_id, int max_symbols_per_step) {
+    int blank_id, int max_symbols_per_step, int tracked_token_id) {
+    state.last_tracked_score = -1e30f;
     if (!state.initialized) {
         int num_layers = prediction.config().num_lstm_layers;
         size_t hs = prediction.config().pred_hidden;
@@ -66,6 +67,15 @@ std::vector<int> rnnt_streaming_decode_chunk(
                 }
             }
             float confidence = std::exp(best_lp);
+
+            // Track requested token's score so callers can react to model
+            // confidence before the decoder commits (e.g. EOU endpointing).
+            if (tracked_token_id >= 0 && tracked_token_id < vocab_size) {
+                float tracked_lp = label_data[tracked_token_id];
+                if (tracked_lp > state.last_tracked_score) {
+                    state.last_tracked_score = tracked_lp;
+                }
+            }
 
             // Duration: RNNT models have no duration head (empty dur_lp)
             int skip = 1;
