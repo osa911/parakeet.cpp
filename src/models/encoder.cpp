@@ -54,8 +54,12 @@ Tensor FeedForward::forward(const Tensor &input) const {
     if (is_int8_) {
         // int8 path: ops::int8_matmul dequantizes and projects in one kernel.
         // Bias (if any) is applied after, same as the fp16 path via fc1_.
+        // Guard on bias().storage() too: a Linear with bias=true that never
+        // received a bias from load_state_dict has an empty fp32 slot, and
+        // ops::add(fp16, empty_fp32) silently promotes to fp32 — which would
+        // trip the next int8_matmul's fp16 precondition.
         x = ops::int8_matmul(x, fc1_w_int8_, fc1_w_scale_);
-        if (fc1_.has_bias()) {
+        if (fc1_.has_bias() && fc1_.bias().storage()) {
             x = ops::add(x, fc1_.bias());
         }
     } else {
@@ -67,7 +71,7 @@ Tensor FeedForward::forward(const Tensor &input) const {
 
     if (is_int8_) {
         x = ops::int8_matmul(x, fc2_w_int8_, fc2_w_scale_);
-        if (fc2_.has_bias()) {
+        if (fc2_.has_bias() && fc2_.bias().storage()) {
             x = ops::add(x, fc2_.bias());
         }
     } else {
@@ -193,18 +197,27 @@ Tensor ConformerAttention::rel_position_attention(const Tensor &query,
 
     // Project Q, K, V — int8 path bypasses Linear::forward() and calls
     // ops::int8_matmul directly, then adds any bias from the fp16 Linear.
+    //
+    // The bias guard must check both has_bias() AND bias().storage(): a
+    // Linear constructed with bias=true reserves a `bias_` parameter slot,
+    // but if load_state_dict was called without a bias entry the slot stays
+    // default-constructed — empty storage with the default fp32 dtype.
+    // ops::add(fp16_q, empty_fp32_bias) silently broadcasts and promotes the
+    // result to fp32, which then propagates through softmax + matmul(attn,v)
+    // and trips ops::int8_matmul's fp16 precondition at out_proj. This
+    // mirrors Linear::forward()'s own `has_bias_ && bias_.storage()` guard.
     Tensor q, k, v;
     if (is_int8_) {
         q = ops::int8_matmul(query, q_w_int8_, q_w_scale_);
-        if (mha_.q_proj().has_bias()) {
+        if (mha_.q_proj().has_bias() && mha_.q_proj().bias().storage()) {
             q = ops::add(q, mha_.q_proj().bias());
         }
         k = ops::int8_matmul(key, k_w_int8_, k_w_scale_);
-        if (mha_.k_proj().has_bias()) {
+        if (mha_.k_proj().has_bias() && mha_.k_proj().bias().storage()) {
             k = ops::add(k, mha_.k_proj().bias());
         }
         v = ops::int8_matmul(value, v_w_int8_, v_w_scale_);
-        if (mha_.v_proj().has_bias()) {
+        if (mha_.v_proj().has_bias() && mha_.v_proj().bias().storage()) {
             v = ops::add(v, mha_.v_proj().bias());
         }
     } else {
@@ -267,9 +280,12 @@ Tensor ConformerAttention::rel_position_attention(const Tensor &query,
     out = out.reshape({batch, seq_len, static_cast<size_t>(d_model)});
 
     // Output projection — int8 path bypasses Linear::forward().
+    // Same has_bias()/storage() guard as the q/k/v projections above:
+    // a Linear with bias=true but no loaded bias has an empty fp32 slot,
+    // and ops::add(fp16, empty_fp32) silently promotes to fp32.
     if (is_int8_) {
         auto result = ops::int8_matmul(out, o_w_int8_, o_w_scale_);
-        if (mha_.out_proj().has_bias()) {
+        if (mha_.out_proj().has_bias() && mha_.out_proj().bias().storage()) {
             return ops::add(result, mha_.out_proj().bias());
         }
         return result;
