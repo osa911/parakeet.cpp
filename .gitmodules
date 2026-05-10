@@ -1,3 +1,7 @@
+# Full clone (shallow = false) is required so `git bisect` can walk
+# axiom-side history when triaging regressions in int8 / future kernel work.
+# A shallow clone truncates history and turns bisect into "checkout fails"
+# noise; the extra disk is cheap compared to the developer time saved.
 [submodule "third_party/axiom"]
 	path = third_party/axiom
 	url = https://github.com/osa911/axiom

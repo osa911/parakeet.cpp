@@ -1,11 +1,17 @@
-import numpy as np
+import subprocess
 import sys
 from pathlib import Path
+
+import numpy as np
+import safetensors.numpy
 
 # Allow importing from scripts/
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from quantize_int8 import quantize_block_sym
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_PATH = REPO_ROOT / "scripts" / "quantize_int8.py"
 
 
 def test_round_trip_dequant_within_tolerance():
@@ -43,3 +49,79 @@ def test_int8_range_clipped():
     W[0, 0] = 1.0e10  # absurd outlier
     W_int8, _ = quantize_block_sym(W, block_size=32)
     assert W_int8.min() >= -128 and W_int8.max() <= 127
+
+
+def _write_wrong_naming_checkpoint(path: Path) -> None:
+    """Write a safetensors file whose key naming does NOT match QUANTIZABLE_PATTERNS.
+
+    Uses PyTorch-export-style keys (e.g. `attention.q.weight`) instead of the
+    axiom-style keys (`mha_.q_proj.weight`) that the script targets. Result:
+    the quantizable predicate misses every matmul weight and the script
+    completes with quant_count == 0.
+    """
+    tensors = {
+        # Wrong naming convention — none of these match QUANTIZABLE_PATTERNS.
+        "attention.q.weight": np.zeros((64, 64), dtype=np.float32),
+        "attention.k.weight": np.zeros((64, 64), dtype=np.float32),
+        "attention.v.weight": np.zeros((64, 64), dtype=np.float32),
+        "attention.out.weight": np.zeros((64, 64), dtype=np.float32),
+        "ffn.fc1.weight": np.zeros((256, 64), dtype=np.float32),
+        "ffn.fc2.weight": np.zeros((64, 256), dtype=np.float32),
+    }
+    safetensors.numpy.save_file(tensors, str(path))
+
+
+def test_strict_flag_errors_on_zero_quantized(tmp_path):
+    """--strict must exit non-zero if no matmul weights were quantized."""
+    in_path = tmp_path / "wrong-naming.safetensors"
+    out_path = tmp_path / "wrong-naming-int8.safetensors"
+    _write_wrong_naming_checkpoint(in_path)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--in",
+            str(in_path),
+            "--out",
+            str(out_path),
+            "--strict",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0, (
+        f"expected non-zero exit under --strict with 0 quantized; "
+        f"got rc={result.returncode}\nstdout={result.stdout}\n"
+        f"stderr={result.stderr}"
+    )
+    assert "0 weights" in result.stderr or "quantized" in result.stderr, (
+        f"expected diagnostic stderr; got: {result.stderr}"
+    )
+    # Output file must NOT have been written when --strict errors out.
+    assert not out_path.exists(), "output file should not be written on --strict error"
+
+
+def test_strict_flag_default_off_still_passes_through(tmp_path):
+    """Without --strict, a zero-quant pass-through still writes the output."""
+    in_path = tmp_path / "wrong-naming.safetensors"
+    out_path = tmp_path / "wrong-naming-passthrough.safetensors"
+    _write_wrong_naming_checkpoint(in_path)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--in",
+            str(in_path),
+            "--out",
+            str(out_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        f"default mode must NOT fail on zero-quant; got rc={result.returncode}\n"
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+    assert out_path.exists(), "output file should be written without --strict"

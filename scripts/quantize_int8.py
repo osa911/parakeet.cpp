@@ -22,6 +22,7 @@ Usage:
 """
 
 import argparse
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -72,6 +73,19 @@ def main():
     ap.add_argument("--in", dest="in_path", required=True, type=Path)
     ap.add_argument("--out", dest="out_path", required=True, type=Path)
     ap.add_argument("--block-size", type=int, default=32)
+    ap.add_argument(
+        "--strict",
+        action="store_true",
+        help=(
+            "Exit non-zero if zero matmul weights were quantized. "
+            "Without --strict, a checkpoint whose key names don't match "
+            "QUANTIZABLE_PATTERNS (e.g. PyTorch-export style "
+            "'attention.q.weight' instead of axiom-style "
+            "'mha_.q_proj.weight') silently produces an unquantized output. "
+            "Use --strict in CI / release pipelines to fail fast on the "
+            "format mismatch."
+        ),
+    )
     args = ap.parse_args()
 
     out_tensors = {}
@@ -106,6 +120,20 @@ def main():
     if total_bytes_in > 0:
         print(f"Total: {total_bytes_in / 1e6:.0f} MB -> {total_bytes_out / 1e6:.0f} MB "
               f"({100 * (1 - total_bytes_out / total_bytes_in):.0f}% reduction)")
+
+    if args.strict and quant_count == 0:
+        # Don't write the output file — a zero-quant pass-through under
+        # --strict almost always means the input checkpoint uses a different
+        # key naming convention than axiom (e.g. PyTorch-export style). Fail
+        # loud so the operator notices, instead of silently shipping an
+        # unquantized file that the C++ side will then refuse to load.
+        print(
+            f"\nERROR: --strict mode and 0 weights were quantized. Likely "
+            f"key-naming mismatch — expected axiom-style keys matching "
+            f"{QUANTIZABLE_PATTERNS}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     safetensors.numpy.save_file(out_tensors, args.out_path)
     print(f"\nWrote {args.out_path}")
