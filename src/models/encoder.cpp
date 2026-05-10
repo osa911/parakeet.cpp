@@ -1,8 +1,11 @@
 #include "parakeet/models/encoder.hpp"
 
 #include <cmath>
+#include <string>
 
+#include <axiom/error.hpp>
 #include <axiom/nn/positional.hpp>
+#include <axiom/ops/int8_matmul.hpp>
 
 namespace parakeet::models {
 
@@ -13,12 +16,88 @@ FeedForward::FeedForward(float dropout, bool bias)
     AX_REGISTER_MODULES(norm_, fc1_, fc2_, dropout_);
 }
 
+void FeedForward::load_int8_weights(Tensor fc1_w_int8, Tensor fc1_w_scale,
+                                    Tensor fc2_w_int8, Tensor fc2_w_scale) {
+    fc1_w_int8_  = std::move(fc1_w_int8);
+    fc1_w_scale_ = std::move(fc1_w_scale);
+    fc2_w_int8_  = std::move(fc2_w_int8);
+    fc2_w_scale_ = std::move(fc2_w_scale);
+    is_int8_ = true;
+}
+
+void FeedForward::reset_int8() {
+    is_int8_ = false;
+    fc1_w_int8_  = Tensor();
+    fc1_w_scale_ = Tensor();
+    fc2_w_int8_  = Tensor();
+    fc2_w_scale_ = Tensor();
+}
+
+Module &FeedForward::to(Device device) {
+    Module::to(device);
+    if (is_int8_) {
+        if (fc1_w_int8_.storage())  fc1_w_int8_  = fc1_w_int8_.to(device);
+        if (fc1_w_scale_.storage()) fc1_w_scale_ = fc1_w_scale_.to(device);
+        if (fc2_w_int8_.storage())  fc2_w_int8_  = fc2_w_int8_.to(device);
+        if (fc2_w_scale_.storage()) fc2_w_scale_ = fc2_w_scale_.to(device);
+    }
+    return *this;
+}
+
+Module &FeedForward::to(DType dtype) {
+    Module::to(dtype);
+    // Intentionally do NOT astype the int8 weight or fp16 scale fields —
+    // their dtypes are fixed by the quantization scheme (Int8 / Float16)
+    // and astype() would corrupt the bit pattern.
+    return *this;
+}
+
+Device FeedForward::int8_weights_device() const {
+    return fc1_w_int8_.storage() ? fc1_w_int8_.device() : Device::CPU;
+}
+
+bool FeedForward::all_int8_on(Device d) const {
+    // Tensors with no storage abstain — they vote `true` vacuously. This keeps
+    // the predicate well-defined on a non-int8 FeedForward (where none of the
+    // bare fields have been loaded) and on partial loads. On a fully loaded
+    // int8 FeedForward, all four fields must agree with `d`.
+    auto on = [&](const Tensor &t) {
+        return !t.storage() || t.device() == d;
+    };
+    return on(fc1_w_int8_) && on(fc1_w_scale_) && on(fc2_w_int8_) &&
+           on(fc2_w_scale_);
+}
+
 Tensor FeedForward::forward(const Tensor &input) const {
     auto x = norm_(input);
-    x = fc1_(x);
+
+    if (is_int8_) {
+        // int8 path: ops::int8_matmul dequantizes and projects in one kernel.
+        // Bias (if any) is applied after, same as the fp16 path via fc1_.
+        // Guard on bias().storage() too: a Linear with bias=true that never
+        // received a bias from load_state_dict has an empty fp32 slot, and
+        // ops::add(fp16, empty_fp32) silently promotes to fp32 — which would
+        // trip the next int8_matmul's fp16 precondition.
+        x = ops::int8_matmul(x, fc1_w_int8_, fc1_w_scale_);
+        if (fc1_.has_bias() && fc1_.bias().storage()) {
+            x = ops::add(x, fc1_.bias());
+        }
+    } else {
+        x = fc1_(x);
+    }
+
     x = ops::silu(x);
     x = dropout_(x);
-    x = fc2_(x);
+
+    if (is_int8_) {
+        x = ops::int8_matmul(x, fc2_w_int8_, fc2_w_scale_);
+        if (fc2_.has_bias() && fc2_.bias().storage()) {
+            x = ops::add(x, fc2_.bias());
+        }
+    } else {
+        x = fc2_(x);
+    }
+
     return input + x * 0.5f; // macaron half-step
 }
 
@@ -59,6 +138,68 @@ ConformerAttention::ConformerAttention(int num_heads, float dropout)
     AX_REGISTER_PARAMETERS(pos_bias_u_, pos_bias_v_);
 }
 
+void ConformerAttention::load_int8_weights(Tensor q_int8, Tensor q_scale,
+                                           Tensor k_int8, Tensor k_scale,
+                                           Tensor v_int8, Tensor v_scale,
+                                           Tensor o_int8, Tensor o_scale) {
+    q_w_int8_  = std::move(q_int8);
+    q_w_scale_ = std::move(q_scale);
+    k_w_int8_  = std::move(k_int8);
+    k_w_scale_ = std::move(k_scale);
+    v_w_int8_  = std::move(v_int8);
+    v_w_scale_ = std::move(v_scale);
+    o_w_int8_  = std::move(o_int8);
+    o_w_scale_ = std::move(o_scale);
+    is_int8_ = true;
+}
+
+void ConformerAttention::reset_int8() {
+    is_int8_ = false;
+    q_w_int8_ = Tensor(); q_w_scale_ = Tensor();
+    k_w_int8_ = Tensor(); k_w_scale_ = Tensor();
+    v_w_int8_ = Tensor(); v_w_scale_ = Tensor();
+    o_w_int8_ = Tensor(); o_w_scale_ = Tensor();
+}
+
+Module &ConformerAttention::to(Device device) {
+    Module::to(device);
+    if (is_int8_) {
+        if (q_w_int8_.storage())  q_w_int8_  = q_w_int8_.to(device);
+        if (q_w_scale_.storage()) q_w_scale_ = q_w_scale_.to(device);
+        if (k_w_int8_.storage())  k_w_int8_  = k_w_int8_.to(device);
+        if (k_w_scale_.storage()) k_w_scale_ = k_w_scale_.to(device);
+        if (v_w_int8_.storage())  v_w_int8_  = v_w_int8_.to(device);
+        if (v_w_scale_.storage()) v_w_scale_ = v_w_scale_.to(device);
+        if (o_w_int8_.storage())  o_w_int8_  = o_w_int8_.to(device);
+        if (o_w_scale_.storage()) o_w_scale_ = o_w_scale_.to(device);
+    }
+    return *this;
+}
+
+Module &ConformerAttention::to(DType dtype) {
+    Module::to(dtype);
+    // Same rationale as FeedForward::to(DType): int8 + fp16 scale dtypes are
+    // fixed by the quantization scheme and must not be astype()d.
+    return *this;
+}
+
+Device ConformerAttention::int8_weights_device() const {
+    return q_w_int8_.storage() ? q_w_int8_.device() : Device::CPU;
+}
+
+bool ConformerAttention::all_int8_on(Device d) const {
+    // See FeedForward::all_int8_on() for the abstention rule. On a fully
+    // loaded int8 ConformerAttention, all 8 fields (4 weights + 4 scales)
+    // must agree with `d`.
+    auto on = [&](const Tensor &t) {
+        return !t.storage() || t.device() == d;
+    };
+    return on(q_w_int8_) && on(q_w_scale_) &&
+           on(k_w_int8_) && on(k_w_scale_) &&
+           on(v_w_int8_) && on(v_w_scale_) &&
+           on(o_w_int8_) && on(o_w_scale_);
+}
+
 Tensor ConformerAttention::rel_shift(const Tensor &x) {
     // x: (batch, heads, seq_len, 2*seq_len-1)
     // Returns: (batch, heads, seq_len, seq_len)
@@ -94,9 +235,37 @@ Tensor ConformerAttention::rel_position_attention(const Tensor &query,
     // pos_emb: (2*seq-1, d_model)
 
     int num_heads = mha_.num_heads();
-    auto q = mha_.q_proj()(query);
-    auto k = mha_.k_proj()(key);
-    auto v = mha_.v_proj()(value);
+
+    // Project Q, K, V — int8 path bypasses Linear::forward() and calls
+    // ops::int8_matmul directly, then adds any bias from the fp16 Linear.
+    //
+    // The bias guard must check both has_bias() AND bias().storage(): a
+    // Linear constructed with bias=true reserves a `bias_` parameter slot,
+    // but if load_state_dict was called without a bias entry the slot stays
+    // default-constructed — empty storage with the default fp32 dtype.
+    // ops::add(fp16_q, empty_fp32_bias) silently broadcasts and promotes the
+    // result to fp32, which then propagates through softmax + matmul(attn,v)
+    // and trips ops::int8_matmul's fp16 precondition at out_proj. This
+    // mirrors Linear::forward()'s own `has_bias_ && bias_.storage()` guard.
+    Tensor q, k, v;
+    if (is_int8_) {
+        q = ops::int8_matmul(query, q_w_int8_, q_w_scale_);
+        if (mha_.q_proj().has_bias() && mha_.q_proj().bias().storage()) {
+            q = ops::add(q, mha_.q_proj().bias());
+        }
+        k = ops::int8_matmul(key, k_w_int8_, k_w_scale_);
+        if (mha_.k_proj().has_bias() && mha_.k_proj().bias().storage()) {
+            k = ops::add(k, mha_.k_proj().bias());
+        }
+        v = ops::int8_matmul(value, v_w_int8_, v_w_scale_);
+        if (mha_.v_proj().has_bias() && mha_.v_proj().bias().storage()) {
+            v = ops::add(v, mha_.v_proj().bias());
+        }
+    } else {
+        q = mha_.q_proj()(query);
+        k = mha_.k_proj()(key);
+        v = mha_.v_proj()(value);
+    }
 
     auto d_model = static_cast<int>(q.shape().back());
     int head_dim = d_model / num_heads;
@@ -151,6 +320,17 @@ Tensor ConformerAttention::rel_position_attention(const Tensor &query,
     out = out.transpose({0, 2, 1, 3});
     out = out.reshape({batch, seq_len, static_cast<size_t>(d_model)});
 
+    // Output projection — int8 path bypasses Linear::forward().
+    // Same has_bias()/storage() guard as the q/k/v projections above:
+    // a Linear with bias=true but no loaded bias has an empty fp32 slot,
+    // and ops::add(fp16, empty_fp32) silently promotes to fp32.
+    if (is_int8_) {
+        auto result = ops::int8_matmul(out, o_w_int8_, o_w_scale_);
+        if (mha_.out_proj().has_bias() && mha_.out_proj().bias().storage()) {
+            return ops::add(result, mha_.out_proj().bias());
+        }
+        return result;
+    }
     return mha_.out_proj()(out);
 }
 
@@ -168,6 +348,37 @@ ConformerBlock::ConformerBlock(const EncoderConfig &config)
     : ffn1_(config.dropout), attn_(config.num_heads, config.dropout),
       conv_(config.hidden_size, config.dropout), ffn2_(config.dropout) {
     AX_REGISTER_MODULES(ffn1_, attn_, conv_, ffn2_, final_norm_);
+}
+
+void ConformerBlock::load_int8_weights(
+    Tensor q_int8, Tensor q_scale,
+    Tensor k_int8, Tensor k_scale,
+    Tensor v_int8, Tensor v_scale,
+    Tensor o_int8, Tensor o_scale,
+    Tensor ffn1_fc1_int8, Tensor ffn1_fc1_scale,
+    Tensor ffn1_fc2_int8, Tensor ffn1_fc2_scale,
+    Tensor ffn2_fc1_int8, Tensor ffn2_fc1_scale,
+    Tensor ffn2_fc2_int8, Tensor ffn2_fc2_scale) {
+
+    attn_.load_int8_weights(
+        std::move(q_int8),  std::move(q_scale),
+        std::move(k_int8),  std::move(k_scale),
+        std::move(v_int8),  std::move(v_scale),
+        std::move(o_int8),  std::move(o_scale));
+
+    ffn1_.load_int8_weights(
+        std::move(ffn1_fc1_int8), std::move(ffn1_fc1_scale),
+        std::move(ffn1_fc2_int8), std::move(ffn1_fc2_scale));
+
+    ffn2_.load_int8_weights(
+        std::move(ffn2_fc1_int8), std::move(ffn2_fc1_scale),
+        std::move(ffn2_fc2_int8), std::move(ffn2_fc2_scale));
+}
+
+void ConformerBlock::reset_int8() {
+    attn_.reset_int8();
+    ffn1_.reset_int8();
+    ffn2_.reset_int8();
 }
 
 Tensor ConformerBlock::forward(const Tensor &input, const Tensor &pos_emb,
@@ -220,11 +431,99 @@ Tensor ConvSubsampling::forward(const Tensor &input) const {
 // ─── FastConformerEncoder ───────────────────────────────────────────────────
 
 FastConformerEncoder::FastConformerEncoder(const EncoderConfig &config)
-    : subsampling_(config.subsampling_channels) {
+    : config_(config), subsampling_(config.subsampling_channels) {
     for (int i = 0; i < config.num_layers; ++i) {
         layers_.emplace_back<ConformerBlock>(config);
     }
     AX_REGISTER_MODULES(subsampling_, layers_);
+}
+
+void FastConformerEncoder::load_state_dict(
+    const std::map<std::string, Tensor> &state_dict,
+    const std::string &prefix, bool strict) {
+
+    // Reset every child block's int8 routing flag BEFORE the base load. This
+    // mirrors the encoder-level `is_int8_ = false` below: if load_state_dict
+    // is called twice — once with int8 weights, then with fp16-only weights —
+    // the children's `is_int8_` would otherwise stay `true` and forward()
+    // would route through ops::int8_matmul against now-empty bare tensors,
+    // which trips int8_matmul's storage assertion. Symmetry with the encoder
+    // self-reset; without this, a re-load is a silent footgun.
+    for (auto &block : layers_.each<ConformerBlock>()) {
+        block.reset_int8();
+    }
+
+    // Always load fp16 weights first via the base Module logic.
+    Module::load_state_dict(state_dict, prefix, strict);
+
+    // Detect whether any _quantized key in the map belongs to this encoder.
+    is_int8_ = false;
+    static const std::string kQuantizedSuffix = "_quantized";
+    for (const auto &entry : state_dict) {
+        const std::string &name = entry.first;
+        if (name.size() >= kQuantizedSuffix.size() &&
+            name.ends_with(kQuantizedSuffix) &&
+            name.rfind(prefix, 0) == 0) {
+            is_int8_ = true;
+            break;
+        }
+    }
+
+    if (is_int8_) {
+        load_int8_weights_(state_dict, prefix);
+    }
+}
+
+void FastConformerEncoder::load_int8_weights_(
+    const std::map<std::string, Tensor> &state_dict,
+    const std::string &prefix) {
+
+    // Helper: look up a required key, throw descriptive error if missing.
+    auto get = [&](const std::string &key) -> Tensor {
+        auto it = state_dict.find(key);
+        if (it == state_dict.end()) {
+            throw RuntimeError::internal(
+                "int8 weight key '" + key + "' not found in state_dict");
+        }
+        return it->second;
+    };
+
+    int num_layers = config_.num_layers;
+
+    for (int i = 0; i < num_layers; ++i) {
+        // Full key prefix for this layer, e.g. "encoder_.layers_.0."
+        std::string lp = prefix + "layers_." + std::to_string(i) + ".";
+
+        // Attention projection keys.
+        // Axiom fp16 key: lp + "attn_.mha_.q_proj.weight"
+        // Quantizer output (strips ".weight", appends _quantized/_scale):
+        //   lp + "attn_.mha_.q_proj_quantized"
+        //   lp + "attn_.mha_.q_proj_scale"
+        const std::string ap = lp + "attn_.mha_.";
+
+        // FeedForward keys.
+        // Axiom fp16 key: lp + "ffn1_.fc1_.weight"
+        // Quantizer output: lp + "ffn1_.fc1__quantized"  (double underscore
+        //   because the registered submodule name is "fc1_" and we strip the
+        //   ".weight" suffix from "fc1_.weight")
+        const std::string f1p = lp + "ffn1_.";
+        const std::string f2p = lp + "ffn2_.";
+
+        auto &block = static_cast<ConformerBlock &>(layers_[static_cast<size_t>(i)]);
+        block.load_int8_weights(
+            // attention q/k/v/out_proj
+            get(ap + "q_proj_quantized"),   get(ap + "q_proj_scale"),
+            get(ap + "k_proj_quantized"),   get(ap + "k_proj_scale"),
+            get(ap + "v_proj_quantized"),   get(ap + "v_proj_scale"),
+            get(ap + "out_proj_quantized"), get(ap + "out_proj_scale"),
+            // ffn1 fc1 / fc2
+            get(f1p + "fc1__quantized"), get(f1p + "fc1__scale"),
+            get(f1p + "fc2__quantized"), get(f1p + "fc2__scale"),
+            // ffn2 fc1 / fc2
+            get(f2p + "fc1__quantized"), get(f2p + "fc1__scale"),
+            get(f2p + "fc2__quantized"), get(f2p + "fc2__scale")
+        );
+    }
 }
 
 Tensor FastConformerEncoder::forward(const Tensor &input,
