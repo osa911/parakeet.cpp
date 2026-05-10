@@ -1,4 +1,4 @@
 [submodule "third_party/axiom"]
 	path = third_party/axiom
-	url = https://github.com/Frikallo/axiom
-	shallow = true
+	url = https://github.com/osa911/axiom
+	shallow = false
