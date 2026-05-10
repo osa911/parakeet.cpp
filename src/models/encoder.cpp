@@ -25,6 +25,29 @@ void FeedForward::load_int8_weights(Tensor fc1_w_int8, Tensor fc1_w_scale,
     is_int8_ = true;
 }
 
+Module &FeedForward::to(Device device) {
+    Module::to(device);
+    if (is_int8_) {
+        if (fc1_w_int8_.storage())  fc1_w_int8_  = fc1_w_int8_.to(device);
+        if (fc1_w_scale_.storage()) fc1_w_scale_ = fc1_w_scale_.to(device);
+        if (fc2_w_int8_.storage())  fc2_w_int8_  = fc2_w_int8_.to(device);
+        if (fc2_w_scale_.storage()) fc2_w_scale_ = fc2_w_scale_.to(device);
+    }
+    return *this;
+}
+
+Module &FeedForward::to(DType dtype) {
+    Module::to(dtype);
+    // Intentionally do NOT astype the int8 weight or fp16 scale fields —
+    // their dtypes are fixed by the quantization scheme (Int8 / Float16)
+    // and astype() would corrupt the bit pattern.
+    return *this;
+}
+
+Device FeedForward::int8_weights_device() const {
+    return fc1_w_int8_.storage() ? fc1_w_int8_.device() : Device::CPU;
+}
+
 Tensor FeedForward::forward(const Tensor &input) const {
     auto x = norm_(input);
 
@@ -104,6 +127,32 @@ void ConformerAttention::load_int8_weights(Tensor q_int8, Tensor q_scale,
     o_w_int8_  = std::move(o_int8);
     o_w_scale_ = std::move(o_scale);
     is_int8_ = true;
+}
+
+Module &ConformerAttention::to(Device device) {
+    Module::to(device);
+    if (is_int8_) {
+        if (q_w_int8_.storage())  q_w_int8_  = q_w_int8_.to(device);
+        if (q_w_scale_.storage()) q_w_scale_ = q_w_scale_.to(device);
+        if (k_w_int8_.storage())  k_w_int8_  = k_w_int8_.to(device);
+        if (k_w_scale_.storage()) k_w_scale_ = k_w_scale_.to(device);
+        if (v_w_int8_.storage())  v_w_int8_  = v_w_int8_.to(device);
+        if (v_w_scale_.storage()) v_w_scale_ = v_w_scale_.to(device);
+        if (o_w_int8_.storage())  o_w_int8_  = o_w_int8_.to(device);
+        if (o_w_scale_.storage()) o_w_scale_ = o_w_scale_.to(device);
+    }
+    return *this;
+}
+
+Module &ConformerAttention::to(DType dtype) {
+    Module::to(dtype);
+    // Same rationale as FeedForward::to(DType): int8 + fp16 scale dtypes are
+    // fixed by the quantization scheme and must not be astype()d.
+    return *this;
+}
+
+Device ConformerAttention::int8_weights_device() const {
+    return q_w_int8_.storage() ? q_w_int8_.device() : Device::CPU;
 }
 
 Tensor ConformerAttention::rel_shift(const Tensor &x) {

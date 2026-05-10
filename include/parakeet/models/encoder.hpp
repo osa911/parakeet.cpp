@@ -32,6 +32,23 @@ class FeedForward : public Module {
 
     bool is_int8() const { return is_int8_; }
 
+    // Override Module::to(Device) so the bare int8 weight + fp16 scale fields
+    // (which are NOT registered as Module parameters) are migrated alongside
+    // the registered submodules. Without this override, ops::int8_matmul
+    // receives a GPU activation paired with CPU-resident weights and aborts
+    // at the Metal command-encoder layer.
+    Module &to(Device device) override;
+    // Defensive no-op for dtype migration: int8 weights and their fp16 scales
+    // have fixed dtypes by the quantization scheme — astype()ing them would
+    // corrupt the bit pattern. The base-class implementation is invoked for
+    // registered params/submodules; the int8 fields are intentionally skipped.
+    Module &to(DType dtype) override;
+
+    // Test/diagnostic helper: device of the bare fc1 int8 weight tensor (or
+    // CPU if not loaded). Used to verify Module::to(Device) actually migrated
+    // the int8 fields. (See Int8DeviceCoercion gtest.)
+    Device int8_weights_device() const;
+
   private:
     LayerNorm norm_;
     Linear fc1_;
@@ -85,6 +102,15 @@ class ConformerAttention : public Module {
                            Tensor o_int8, Tensor o_scale);
 
     bool is_int8() const { return is_int8_; }
+
+    // See FeedForward::to() — same rationale: bare int8 + scale fields are
+    // not registered as Module parameters, so the base Module::to(Device)
+    // would leave them on CPU. Defensive no-op for dtype.
+    Module &to(Device device) override;
+    Module &to(DType dtype) override;
+
+    // Test/diagnostic helper — see FeedForward::int8_weights_device().
+    Device int8_weights_device() const;
 
   private:
     LayerNorm norm_;
