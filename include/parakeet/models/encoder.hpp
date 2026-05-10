@@ -30,6 +30,13 @@ class FeedForward : public Module {
     void load_int8_weights(Tensor fc1_w_int8, Tensor fc1_w_scale,
                            Tensor fc2_w_int8, Tensor fc2_w_scale);
 
+    // Clears the int8 routing flag and drops the bare weight/scale tensors.
+    // Called by FastConformerEncoder::load_state_dict at the top of every
+    // load (mirroring its own `is_int8_ = false` reset) so a second load
+    // with an fp16-only state_dict doesn't leave forward() routing through
+    // ops::int8_matmul against now-empty weight tensors.
+    void reset_int8();
+
     bool is_int8() const { return is_int8_; }
 
     // Override Module::to(Device) so the bare int8 weight + fp16 scale fields
@@ -47,7 +54,20 @@ class FeedForward : public Module {
     // Test/diagnostic helper: device of the bare fc1 int8 weight tensor (or
     // CPU if not loaded). Used to verify Module::to(Device) actually migrated
     // the int8 fields. (See Int8DeviceCoercion gtest.)
+    //
+    // NOTE: prefer `all_int8_on(Device)` for regression coverage — this single-
+    // field accessor was the original gate but it only observes `fc1_w_int8_`,
+    // so a regression that breaks the migration of `fc2_w_int8_` or either of
+    // the per-block fp16 scales would silently pass the device-coercion test.
     Device int8_weights_device() const;
+
+    // Returns true iff EVERY bare int8 weight + fp16 scale tensor (fc1_w_int8_,
+    // fc1_w_scale_, fc2_w_int8_, fc2_w_scale_) is currently resident on `d`.
+    // Tensors with no storage (i.e. load_int8_weights was never called) do
+    // not vote — so on a non-int8 FeedForward this returns true regardless of
+    // `d`. Used by the Int8DeviceCoercion test to guard ALL fields, not just
+    // the canary one returned by `int8_weights_device()`.
+    bool all_int8_on(Device d) const;
 
   private:
     LayerNorm norm_;
@@ -101,6 +121,10 @@ class ConformerAttention : public Module {
                            Tensor k_scale, Tensor v_int8, Tensor v_scale,
                            Tensor o_int8, Tensor o_scale);
 
+    // See FeedForward::reset_int8() — same rationale (reset on re-load so
+    // forward() doesn't route through int8_matmul with stale empty tensors).
+    void reset_int8();
+
     bool is_int8() const { return is_int8_; }
 
     // See FeedForward::to() — same rationale: bare int8 + scale fields are
@@ -110,7 +134,13 @@ class ConformerAttention : public Module {
     Module &to(DType dtype) override;
 
     // Test/diagnostic helper — see FeedForward::int8_weights_device().
+    // Same single-field-only caveat applies; prefer `all_int8_on(Device)`.
     Device int8_weights_device() const;
+
+    // Returns true iff EVERY bare q/k/v/o int8 weight + fp16 scale tensor is
+    // currently resident on `d`. See FeedForward::all_int8_on() for full
+    // rationale.
+    bool all_int8_on(Device d) const;
 
   private:
     LayerNorm norm_;
@@ -162,6 +192,12 @@ class ConformerBlock : public Module {
         // FFN2: fc1, fc2
         Tensor ffn2_fc1_int8, Tensor ffn2_fc1_scale,
         Tensor ffn2_fc2_int8, Tensor ffn2_fc2_scale);
+
+    // Forwards `reset_int8()` to all int8-bearing children (attn_, ffn1_,
+    // ffn2_). Called by FastConformerEncoder::load_state_dict at the top of
+    // every load so a re-load with fp16-only weights doesn't leave child
+    // modules routing through stale int8 weights.
+    void reset_int8();
 
   private:
     FeedForward ffn1_;

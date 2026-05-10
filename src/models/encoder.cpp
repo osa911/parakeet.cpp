@@ -25,6 +25,14 @@ void FeedForward::load_int8_weights(Tensor fc1_w_int8, Tensor fc1_w_scale,
     is_int8_ = true;
 }
 
+void FeedForward::reset_int8() {
+    is_int8_ = false;
+    fc1_w_int8_  = Tensor();
+    fc1_w_scale_ = Tensor();
+    fc2_w_int8_  = Tensor();
+    fc2_w_scale_ = Tensor();
+}
+
 Module &FeedForward::to(Device device) {
     Module::to(device);
     if (is_int8_) {
@@ -46,6 +54,18 @@ Module &FeedForward::to(DType dtype) {
 
 Device FeedForward::int8_weights_device() const {
     return fc1_w_int8_.storage() ? fc1_w_int8_.device() : Device::CPU;
+}
+
+bool FeedForward::all_int8_on(Device d) const {
+    // Tensors with no storage abstain — they vote `true` vacuously. This keeps
+    // the predicate well-defined on a non-int8 FeedForward (where none of the
+    // bare fields have been loaded) and on partial loads. On a fully loaded
+    // int8 FeedForward, all four fields must agree with `d`.
+    auto on = [&](const Tensor &t) {
+        return !t.storage() || t.device() == d;
+    };
+    return on(fc1_w_int8_) && on(fc1_w_scale_) && on(fc2_w_int8_) &&
+           on(fc2_w_scale_);
 }
 
 Tensor FeedForward::forward(const Tensor &input) const {
@@ -133,6 +153,14 @@ void ConformerAttention::load_int8_weights(Tensor q_int8, Tensor q_scale,
     is_int8_ = true;
 }
 
+void ConformerAttention::reset_int8() {
+    is_int8_ = false;
+    q_w_int8_ = Tensor(); q_w_scale_ = Tensor();
+    k_w_int8_ = Tensor(); k_w_scale_ = Tensor();
+    v_w_int8_ = Tensor(); v_w_scale_ = Tensor();
+    o_w_int8_ = Tensor(); o_w_scale_ = Tensor();
+}
+
 Module &ConformerAttention::to(Device device) {
     Module::to(device);
     if (is_int8_) {
@@ -157,6 +185,19 @@ Module &ConformerAttention::to(DType dtype) {
 
 Device ConformerAttention::int8_weights_device() const {
     return q_w_int8_.storage() ? q_w_int8_.device() : Device::CPU;
+}
+
+bool ConformerAttention::all_int8_on(Device d) const {
+    // See FeedForward::all_int8_on() for the abstention rule. On a fully
+    // loaded int8 ConformerAttention, all 8 fields (4 weights + 4 scales)
+    // must agree with `d`.
+    auto on = [&](const Tensor &t) {
+        return !t.storage() || t.device() == d;
+    };
+    return on(q_w_int8_) && on(q_w_scale_) &&
+           on(k_w_int8_) && on(k_w_scale_) &&
+           on(v_w_int8_) && on(v_w_scale_) &&
+           on(o_w_int8_) && on(o_w_scale_);
 }
 
 Tensor ConformerAttention::rel_shift(const Tensor &x) {
@@ -334,6 +375,12 @@ void ConformerBlock::load_int8_weights(
         std::move(ffn2_fc2_int8), std::move(ffn2_fc2_scale));
 }
 
+void ConformerBlock::reset_int8() {
+    attn_.reset_int8();
+    ffn1_.reset_int8();
+    ffn2_.reset_int8();
+}
+
 Tensor ConformerBlock::forward(const Tensor &input, const Tensor &pos_emb,
                                const Tensor &mask) const {
     auto x = ffn1_(input);
@@ -394,6 +441,17 @@ FastConformerEncoder::FastConformerEncoder(const EncoderConfig &config)
 void FastConformerEncoder::load_state_dict(
     const std::map<std::string, Tensor> &state_dict,
     const std::string &prefix, bool strict) {
+
+    // Reset every child block's int8 routing flag BEFORE the base load. This
+    // mirrors the encoder-level `is_int8_ = false` below: if load_state_dict
+    // is called twice — once with int8 weights, then with fp16-only weights —
+    // the children's `is_int8_` would otherwise stay `true` and forward()
+    // would route through ops::int8_matmul against now-empty bare tensors,
+    // which trips int8_matmul's storage assertion. Symmetry with the encoder
+    // self-reset; without this, a re-load is a silent footgun.
+    for (auto &block : layers_.each<ConformerBlock>()) {
+        block.reset_int8();
+    }
 
     // Always load fp16 weights first via the base Module logic.
     Module::load_state_dict(state_dict, prefix, strict);

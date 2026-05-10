@@ -2107,6 +2107,7 @@ TEST(Int8DeviceCoercion, FeedForwardToGPU) {
 
     ASSERT_TRUE(ff.is_int8());
     ASSERT_EQ(ff.int8_weights_device(), Device::CPU);
+    ASSERT_TRUE(ff.all_int8_on(Device::CPU));
 
     // Move FeedForward to GPU. With the buggy base Module::to(Device) the
     // bare int8 fields are skipped (only registered params_ + submodules_ are
@@ -2114,10 +2115,15 @@ TEST(Int8DeviceCoercion, FeedForwardToGPU) {
     // explicitly so they end up on GPU.
     ff.to(Device::GPU);
 
-    EXPECT_EQ(ff.int8_weights_device(), Device::GPU)
-        << "FeedForward::to(Device::GPU) failed to migrate the bare int8 "
-           "weight tensor — Module::to() only iterates registered params_, "
-           "and the override in FeedForward must walk the int8 fields.";
+    // Use the broad predicate so a regression that breaks the migration of
+    // any single field (e.g. fc2_w_int8_ or either scale) fails the test —
+    // the single-field `int8_weights_device()` only observes fc1_w_int8_.
+    EXPECT_TRUE(ff.all_int8_on(Device::GPU))
+        << "FeedForward::to(Device::GPU) failed to migrate one of the bare "
+           "fc1/fc2 int8 weight + fp16 scale fields — Module::to() only "
+           "iterates registered params_, so the override in FeedForward must "
+           "walk EVERY int8 field explicitly. fc1_w_int8_ device: "
+        << static_cast<int>(ff.int8_weights_device());
 #endif
 }
 
@@ -2144,12 +2150,18 @@ TEST(Int8DeviceCoercion, ConformerAttentionToGPU) {
 
     ASSERT_TRUE(attn.is_int8());
     ASSERT_EQ(attn.int8_weights_device(), Device::CPU);
+    ASSERT_TRUE(attn.all_int8_on(Device::CPU));
 
     attn.to(Device::GPU);
 
-    EXPECT_EQ(attn.int8_weights_device(), Device::GPU)
-        << "ConformerAttention::to(Device::GPU) failed to migrate the bare "
-           "q/k/v/out int8 weight tensors — same root cause as FeedForward.";
+    // Broad predicate — covers all 8 fields (q/k/v/o int8 + per-block scales).
+    // The single-field accessor only observes q_w_int8_, so it would miss a
+    // regression that skipped any of k/v/o migrations or any scale.
+    EXPECT_TRUE(attn.all_int8_on(Device::GPU))
+        << "ConformerAttention::to(Device::GPU) failed to migrate one of the "
+           "bare q/k/v/out int8 weight + fp16 scale fields — same root cause "
+           "as FeedForward. q_w_int8_ device: "
+        << static_cast<int>(attn.int8_weights_device());
 #endif
 }
 
