@@ -178,6 +178,13 @@ if(PARAKEET_BUILD_TESTS)
         LINKER_LANGUAGE CXX
     )
     add_test(NAME test_c_api COMMAND test_c_api)
+
+    # WAS-26 L2 integration parity test: nn::Linear gpu_linear vs lazy path
+    add_executable(test_linear_mpsmm_parity tests/test_linear_mpsmm_parity.cpp)
+    target_link_libraries(test_linear_mpsmm_parity PRIVATE parakeet_lib GTest::gtest GTest::gtest_main)
+    add_test(NAME test_linear_mpsmm_parity COMMAND test_linear_mpsmm_parity
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
 endif()
 
 # ── Examples ─────────────────────────────────────────────────────────────────
