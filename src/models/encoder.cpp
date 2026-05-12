@@ -82,121 +82,42 @@ Tensor ConformerConvModule::forward(const Tensor &input) const {
 // ─── ConformerAttention ─────────────────────────────────────────────────────
 
 ConformerAttention::ConformerAttention(int num_heads, float dropout)
-    : mha_(num_heads), qkv_proj_(/*bias=*/true), pos_proj_(false),
-      dropout_(dropout) {
-    // Registration order is mostly cosmetic — registered submodules are
-    // visited in insertion order by Module::load_state_dict and
-    // Module::to(...), but base behavior is order-independent for a
-    // well-formed state_dict (std::map lookup is keyed, not indexed).
-    // qkv_proj_ comes BEFORE mha_ to make `named_parameters()`
-    // introspection list the new fused weight first.
-    AX_REGISTER_MODULES(norm_, qkv_proj_, mha_, pos_proj_, dropout_);
+    : mha_(num_heads), pos_proj_(false), dropout_(dropout) {
+    AX_REGISTER_MODULES(norm_, mha_, pos_proj_, dropout_);
     AX_REGISTER_PARAMETERS(pos_bias_u_, pos_bias_v_);
-}
-
-void ConformerAttention::load_state_dict(
-    const std::map<std::string, Tensor> &state_dict,
-    const std::string &prefix, bool strict) {
-    // The on-disk safetensors layout has three separate
-    //   <prefix>mha_.q_proj.weight
-    //   <prefix>mha_.k_proj.weight
-    //   <prefix>mha_.v_proj.weight
-    // (plus matching .bias if present). The fused qkv_proj_ submodule
-    // registers a single "qkv_proj_.weight" parameter — without this
-    // override, base load_state_dict with strict=false would silently skip
-    // qkv_proj_.weight (no matching key) AND load the three mha_.q/k/v
-    // keys into Linears that are never on the forward path. Result: a
-    // model that runs forward through empty qkv_proj_ → garbage output,
-    // PLUS 3× memory waste in mha_'s q/k/v Linears.
-    //
-    // The override builds a remapped state_dict with the three q/k/v
-    // weights concatenated row-wise into a single qkv_proj_.weight key
-    // (and qkv_proj_.bias if biases are present), then delegates to
-    // base. mha_'s q_proj_/k_proj_/v_proj_ Linears stay registered for
-    // base Module::to(Device) recursion but their weight_ tensors never
-    // get storage — keys for them are absent from the remapped dict.
-    auto qkv_prefix = prefix; // shorthand
-    auto qw_key = qkv_prefix + "mha_.q_proj.weight";
-    auto kw_key = qkv_prefix + "mha_.k_proj.weight";
-    auto vw_key = qkv_prefix + "mha_.v_proj.weight";
-    auto qb_key = qkv_prefix + "mha_.q_proj.bias";
-    auto kb_key = qkv_prefix + "mha_.k_proj.bias";
-    auto vb_key = qkv_prefix + "mha_.v_proj.bias";
-
-    Tensor q_w, k_w, v_w, q_b, k_b, v_b;
-    std::map<std::string, Tensor> remapped;
-    for (const auto &[key, value] : state_dict) {
-        if      (key == qw_key) q_w = value;
-        else if (key == kw_key) k_w = value;
-        else if (key == vw_key) v_w = value;
-        else if (key == qb_key) q_b = value;
-        else if (key == kb_key) k_b = value;
-        else if (key == vb_key) v_b = value;
-        else                    remapped.emplace(key, value);
-    }
-
-    // q/k/v weights are an all-or-nothing set — a partial set means a
-    // malformed checkpoint. Surface loudly rather than silently dropping
-    // some keys and producing wrong forward output. Same rule for biases.
-    int w_count = static_cast<int>(q_w.storage() != nullptr) +
-                  static_cast<int>(k_w.storage() != nullptr) +
-                  static_cast<int>(v_w.storage() != nullptr);
-    if (w_count != 0 && w_count != 3) {
-        throw axiom::RuntimeError(
-            "ConformerAttention::load_state_dict: incomplete q/k/v.weight "
-            "set in state_dict — expected all three or none, got " +
-            std::to_string(w_count) + " of 3 for prefix '" + prefix + "'");
-    }
-    int b_count = static_cast<int>(q_b.storage() != nullptr) +
-                  static_cast<int>(k_b.storage() != nullptr) +
-                  static_cast<int>(v_b.storage() != nullptr);
-    if (b_count != 0 && b_count != 3) {
-        throw axiom::RuntimeError(
-            "ConformerAttention::load_state_dict: incomplete q/k/v.bias "
-            "set in state_dict — expected all three or none, got " +
-            std::to_string(b_count) + " of 3 for prefix '" + prefix + "'");
-    }
-
-    if (w_count == 3) {
-        remapped[qkv_prefix + "qkv_proj_.weight"] =
-            Tensor::cat({q_w, k_w, v_w}, /*axis=*/0);
-    }
-    if (b_count == 3) {
-        remapped[qkv_prefix + "qkv_proj_.bias"] =
-            Tensor::cat({q_b, k_b, v_b}, /*axis=*/0);
-    }
-
-    Module::load_state_dict(remapped, prefix, strict);
 }
 
 void ConformerAttention::load_int8_weights(Tensor q_int8, Tensor q_scale,
                                            Tensor k_int8, Tensor k_scale,
                                            Tensor v_int8, Tensor v_scale,
                                            Tensor o_int8, Tensor o_scale) {
-    // Concat q/k/v along the out_features dim → (3*H, K) int8 weight and
-    // (3*H, K/32) fp16 scale. Order MUST be q-then-k-then-v: the matching
-    // split in rel_position_attention assumes this layout.
-    auto qkv_int8 = Tensor::cat({q_int8, k_int8, v_int8}, /*axis=*/0);
-    auto qkv_scale = Tensor::cat({q_scale, k_scale, v_scale}, /*axis=*/0);
-    qkv_proj_.load_int8_weights(qkv_int8, qkv_scale);
-
-    // out_proj_ stays in mha_ — not part of the fused projection.
+    // const_cast: the mha_ accessors expose const Linear & for read access,
+    // but load_int8_weights is a one-time setup mutation that registers scale_
+    // as a Module parameter inside Linear. Safe because mha_ is our own member.
+    const_cast<Linear &>(mha_.q_proj()).load_int8_weights(q_int8, q_scale);
+    const_cast<Linear &>(mha_.k_proj()).load_int8_weights(k_int8, k_scale);
+    const_cast<Linear &>(mha_.v_proj()).load_int8_weights(v_int8, v_scale);
     const_cast<Linear &>(mha_.out_proj()).load_int8_weights(o_int8, o_scale);
+    // is_int8() is now derived from mha_.q_proj().has_scale() + dtype; no flag to set.
 }
 
 Device ConformerAttention::int8_weights_device() const {
-    // qkv_proj_'s scale is the canary now that q/k/v_proj_ are unused.
-    return qkv_proj_.has_scale() ? qkv_proj_.scale().device() : Device::CPU;
+    // scale_ is registered as a Module parameter by Linear::load_int8_weights,
+    // so Module::to(Device) migrates it correctly — no override needed.
+    return mha_.q_proj().has_scale() ? mha_.q_proj().scale().device()
+                                     : Device::CPU;
 }
 
 bool ConformerAttention::all_int8_on(Device d) const {
     // See FeedForward::all_int8_on() for the abstention rule. On a fully
-    // loaded int8 ConformerAttention, qkv_proj_'s weight + scale and
-    // out_proj_'s weight + scale (4 tensors total) must agree with `d`.
+    // loaded int8 ConformerAttention, all 8 tensors (4 weights + 4 scales)
+    // must agree with `d`.
     auto on = [&](const Tensor &t) {
         return !t.storage() || t.device() == d;
     };
-    return on(qkv_proj_.weight())       && on(qkv_proj_.scale()) &&
+    return on(mha_.q_proj().weight())   && on(mha_.q_proj().scale())   &&
+           on(mha_.k_proj().weight())   && on(mha_.k_proj().scale())   &&
+           on(mha_.v_proj().weight())   && on(mha_.v_proj().scale())   &&
            on(mha_.out_proj().weight()) && on(mha_.out_proj().scale());
 }
 
@@ -249,51 +170,40 @@ Tensor ConformerAttention::rel_position_attention(const Tensor &query,
 
     int num_heads = mha_.num_heads();
 
-    // Fused Q/K/V projection — WAS-28 PR #4b. Replaces 3 separate int8
-    // Linear matmul dispatches with 1, where each row stripe of the fused
-    // weight matches the q/k/v concat order in load_int8_weights /
-    // load_state_dict.
-    //
-    // Self-attention (query == key == value) is the only call pattern.
-    // (key, value) args are kept for caller compatibility but unused —
-    // caller MUST pass query==key==value.
-    (void)key;
-    (void)value;
-    Tensor qkv;
+    // Project Q, K, V — Linear::forward() dispatches to int8_matmul
+    // automatically when weight is Int8 + scale is loaded (WAS-27 fast path).
+    // Bias is applied inside Linear::forward(), no explicit add needed here.
+    Tensor q, k, v;
     {
-        PARAKEET_SP_BEGIN(QKVProj);
-        qkv = qkv_proj_(query); // (B, T, 3*d_model)
-        PARAKEET_SP_END(QKVProj);
+        PARAKEET_SP_BEGIN(QProj);
+        q = mha_.q_proj()(query);
+        PARAKEET_SP_END(QProj);
+    }
+    {
+        PARAKEET_SP_BEGIN(KProj);
+        k = mha_.k_proj()(key);
+        PARAKEET_SP_END(KProj);
+    }
+    {
+        PARAKEET_SP_BEGIN(VProj);
+        v = mha_.v_proj()(value);
+        PARAKEET_SP_END(VProj);
     }
 
-    auto d_model = static_cast<int>(query.shape().back());
+    auto d_model = static_cast<int>(q.shape().back());
     int head_dim = d_model / num_heads;
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
-    auto batch = qkv.shape()[0];
-    auto seq_len = qkv.shape()[1];
+    auto batch = q.shape()[0];
+    auto seq_len = q.shape()[1];
+
+    // Reshape to multi-head: (batch, seq, heads, head_dim) → (batch, heads,
+    // seq, head_dim)
     auto nh = static_cast<size_t>(num_heads);
     auto hd = static_cast<size_t>(head_dim);
-
-    // (B, T, 3*d_model) → (B, T, 3, heads, head_dim) → permute to
-    // (3, B, heads, T, head_dim) so each q/k/v occupies one outer slice.
-    // The downstream `.slice(...).reshape({batch, nh, seq_len, hd})`
-    // chain produces the same final (B, heads, T, head_dim) tensor the
-    // unfused code did; the materialisation cost of those reshapes is
-    // not the win here. The win is the SINGLE int8 matmul dispatch
-    // above instead of three — reducing CPU encoding overhead per
-    // attention block (per WAS-28 PR #4a trace, QKV combined was 36.5%
-    // of Attn CPU dispatch).
-    Tensor q, k, v;
-    {
-        PARAKEET_SP_BEGIN(QKVSplit);
-        auto qkv_split = qkv.reshape({batch, seq_len, 3, nh, hd})
-                             .transpose({2, 0, 3, 1, 4});
-        q = qkv_split.slice({Slice(0, 1)}).reshape({batch, nh, seq_len, hd});
-        k = qkv_split.slice({Slice(1, 2)}).reshape({batch, nh, seq_len, hd});
-        v = qkv_split.slice({Slice(2, 3)}).reshape({batch, nh, seq_len, hd});
-        PARAKEET_SP_END(QKVSplit);
-    }
+    q = q.reshape({batch, seq_len, nh, hd}).transpose({0, 2, 1, 3});
+    k = k.reshape({batch, seq_len, nh, hd}).transpose({0, 2, 1, 3});
+    v = v.reshape({batch, seq_len, nh, hd}).transpose({0, 2, 1, 3});
 
     // q: (batch, heads, seq, head_dim)
     // pos_bias_u/v: (heads, head_dim) → broadcast as (1, heads, 1, head_dim)
