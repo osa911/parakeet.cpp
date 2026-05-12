@@ -93,18 +93,19 @@ class ConformerAttention : public Module {
     }
 
     // Called by FastConformerEncoder::load_state_dict when int8 weights are
-    // detected. Delegates to mha_.q_proj/k_proj/v_proj/out_proj.load_int8_weights()
-    // so Linear::forward() dispatches automatically through the int8 fast path.
+    // detected. Concatenates q/k/v along the output dim and loads the fused
+    // qkv_proj_; loads mha_.out_proj_ separately. Linear::forward() then
+    // dispatches automatically through the int8 fast path.
     void load_int8_weights(Tensor q_int8, Tensor q_scale, Tensor k_int8,
                            Tensor k_scale, Tensor v_int8, Tensor v_scale,
                            Tensor o_int8, Tensor o_scale);
 
-    // Derived from primary state: true iff mha_'s q_proj weight is Int8 and
+    // Derived from primary state: true iff qkv_proj_'s weight is Int8 and
     // its scale_ parameter is loaded. No separate bool field — same rationale
     // as FeedForward::is_int8().
     bool is_int8() const {
-        return mha_.q_proj().has_scale() &&
-               mha_.q_proj().weight().dtype() == DType::Int8;
+        return qkv_proj_.has_scale() &&
+               qkv_proj_.weight().dtype() == DType::Int8;
     }
 
     // Test/diagnostic helper — see FeedForward::int8_weights_device().
@@ -116,9 +117,35 @@ class ConformerAttention : public Module {
     // resident on `d`. See FeedForward::all_int8_on() for full rationale.
     bool all_int8_on(Device d) const;
 
+    // WAS-28 PR #4b: q/k/v projections are fused into qkv_proj_ (out_features
+    // = 3*hidden). mha_.q_proj_/k_proj_/v_proj_ remain as registered Linear
+    // submodules but their weight_ tensors are never populated — the override
+    // of load_state_dict below remaps q/k/v.weight keys into qkv_proj_.weight
+    // via row-wise concat before delegating to base, so 1× memory.
+    // mha_.out_proj_ continues to be loaded normally (out is not fused).
+    //
+    // **DO NOT** introduce `mha_.q_proj()(x)` / `k_proj()(x)` / `v_proj()(x)`
+    // calls inside ConformerAttention::forward or rel_position_attention —
+    // those Linears are intentionally empty; use qkv_proj_(...) and the
+    // 5-D split instead. (Other classes that own their own MultiHeadAttention,
+    // e.g. TransformerBlock, are unaffected — their q/k/v_proj_ Linears are
+    // loaded normally and remain on their forward paths.)
+    const Linear &qkv_proj() const { return qkv_proj_; }
+
+    // Overrides Module::load_state_dict to redirect q/k/v.weight keys into a
+    // single concatenated qkv_proj_.weight. Without the override, base load
+    // would populate mha_.q/k/v_proj_'s weight tensors AND leave qkv_proj_
+    // empty, swapping the dispatch perf win for memory waste.
+    void load_state_dict(const std::map<std::string, Tensor> &state_dict,
+                         const std::string &prefix = "",
+                         bool strict = true) override;
+
   private:
     LayerNorm norm_;
     MultiHeadAttention mha_;
+    // Fused Q/K/V projection — weight shape (3*hidden, hidden), int8 + scale
+    // when quantized. Replaces three separate matmul dispatches with one.
+    Linear qkv_proj_;
     Linear pos_proj_;
     Dropout dropout_;
     Tensor pos_bias_u_; // (num_heads, head_dim) — learned position bias
