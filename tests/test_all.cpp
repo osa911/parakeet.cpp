@@ -1029,6 +1029,110 @@ TEST(PositionEmbedding, CenterRow) {
     EXPECT_NEAR(val0, 0.0f, 1e-5f);
 }
 
+// ─── PosEmb cache (WAS-28 PR #3) ────────────────────────────────────────────
+//
+// FastConformerEncoder memoises sinusoidal_position_embedding by
+// (seq_len, d_model, dtype, device). Signpost traces from WAS-28 PR #2
+// pinned ~22.5% of encoder wall in this single call despite the result
+// depending only on those four parameters. For multi-chunk transcribes
+// (which dominate real wasper workloads via WAS-13 shape bucketing), every
+// chunk after the first becomes a free hash-map lookup.
+
+// Direct test of the cache contract — does not need model weights or audio.
+// Calls FastConformerEncoder::pos_emb() (the public entry point used by
+// forward()) and verifies the cache grows on miss, stays flat on hit, and
+// returns shape-correct tensors keyed by (seq_len, d_model, dtype, device).
+// Uses num_layers=1 for fast construction — the cache lives on
+// FastConformerEncoder itself, not on the conformer blocks.
+TEST(FastConformerEncoder, PosEmbCacheGrowsOnMissHoldsOnHit) {
+    parakeet::models::EncoderConfig cfg;
+    cfg.num_layers = 1;
+    parakeet::models::FastConformerEncoder enc(cfg);
+
+    EXPECT_EQ(enc.pos_emb_cache_size(), 0u);
+
+    auto pe1 = enc.pos_emb(10, 64, DType::Float32, Device::CPU);
+    EXPECT_EQ(enc.pos_emb_cache_size(), 1u);
+    EXPECT_EQ(pe1.shape()[0], 19u); // 2*seq_len - 1
+    EXPECT_EQ(pe1.shape()[1], 64u);
+
+    // Same key → hit.
+    auto pe2 = enc.pos_emb(10, 64, DType::Float32, Device::CPU);
+    EXPECT_EQ(enc.pos_emb_cache_size(), 1u);
+    EXPECT_TRUE(pe1.shares_storage(pe2));
+
+    // Different seq_len → miss → grows to 2.
+    (void)enc.pos_emb(20, 64, DType::Float32, Device::CPU);
+    EXPECT_EQ(enc.pos_emb_cache_size(), 2u);
+
+    // Different d_model → miss → grows to 3.
+    (void)enc.pos_emb(10, 128, DType::Float32, Device::CPU);
+    EXPECT_EQ(enc.pos_emb_cache_size(), 3u);
+
+    // Repeating the very first key still hits — no growth.
+    (void)enc.pos_emb(10, 64, DType::Float32, Device::CPU);
+    EXPECT_EQ(enc.pos_emb_cache_size(), 3u);
+}
+
+// Cache must be flushed when the encoder migrates dtype, device, or
+// reloads weights — otherwise pre-migration tensors become unhittable
+// garbage that grows over time. Mirrors the FeedForward::is_int8()
+// defensive pattern.
+TEST(FastConformerEncoder, PosEmbCacheInvalidatesOnDTypeChange) {
+    parakeet::models::EncoderConfig cfg;
+    cfg.num_layers = 1;
+    parakeet::models::FastConformerEncoder enc(cfg);
+
+    (void)enc.pos_emb(10, 64, DType::Float32, Device::CPU);
+    (void)enc.pos_emb(20, 64, DType::Float32, Device::CPU);
+    EXPECT_EQ(enc.pos_emb_cache_size(), 2u);
+
+    enc.to(DType::Float16);
+    EXPECT_EQ(enc.pos_emb_cache_size(), 0u);
+}
+
+TEST(FastConformerEncoder, PosEmbCacheInvalidatesOnLoadStateDict) {
+    parakeet::models::EncoderConfig cfg;
+    cfg.num_layers = 1;
+    parakeet::models::FastConformerEncoder enc(cfg);
+
+    (void)enc.pos_emb(10, 64, DType::Float32, Device::CPU);
+    EXPECT_EQ(enc.pos_emb_cache_size(), 1u);
+
+    // Empty state dict with strict=false suffices to take the
+    // load_state_dict path without needing real weights.
+    std::map<std::string, Tensor> empty_sd;
+    enc.load_state_dict(empty_sd, "", /*strict=*/false);
+    EXPECT_EQ(enc.pos_emb_cache_size(), 0u);
+}
+
+// E2E confirmation that real forward() calls flow through the cache. Skips
+// when model fixtures are unavailable (this codebase's standard pattern);
+// runs on machines where parakeet.cpp/models/ is populated.
+TEST(FastConformerEncoder, PosEmbCacheReusesAcrossForwards) {
+    if (!has_model_weights() || !has_test_audio()) {
+        GTEST_SKIP() << "Model/audio not available";
+    }
+    auto cfg = make_110m_config();
+    ParakeetTDTCTC model(cfg);
+    auto weights =
+        axiom::io::safetensors::load(model_path("model.safetensors"));
+    model.load_state_dict(weights, "", false);
+
+    EXPECT_EQ(model.encoder().pos_emb_cache_size(), 0u);
+
+    auto audio = read_audio(model_path("2086-149220-0033.wav"));
+    auto features = preprocess_audio(audio.samples);
+
+    // First forward: one new (seq_len, d_model, dtype, device) entry.
+    (void)model.encoder()(features);
+    EXPECT_EQ(model.encoder().pos_emb_cache_size(), 1u);
+
+    // Second forward, same input shape: cache hit — no growth.
+    (void)model.encoder()(features);
+    EXPECT_EQ(model.encoder().pos_emb_cache_size(), 1u);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Phase 3: Diarized Transcription
 // ═══════════════════════════════════════════════════════════════════════════════

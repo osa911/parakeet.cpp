@@ -1,7 +1,10 @@
 #pragma once
 
+#include <cstddef>
+#include <functional>
 #include <map>
 #include <string>
+#include <unordered_map>
 
 #include <axiom/axiom.hpp>
 #include <axiom/nn.hpp>
@@ -215,9 +218,29 @@ class FastConformerEncoder : public Module {
                          const std::string &prefix = "",
                          bool strict = true) override;
 
+    // Overrides invalidate pos_emb_cache_: cached tensors carry the
+    // pre-migration dtype/device and would silently leak otherwise (never
+    // hit, never evicted). Matches the defensive pattern at FeedForward's
+    // is_int8() — same stale-state hazard class.
+    Module &to(Device device) override;
+    Module &to(DType dtype) override;
+
     // Returns true if int8 quantized weights were detected during the most
     // recent load_state_dict call. False if the encoder is running fp16.
     bool is_int8() const { return is_int8_; }
+
+    // Returns the sinusoidal positional embedding for these parameters,
+    // computing and caching it on the first call and reusing the cached
+    // tensor on every subsequent call with the same key. Called once per
+    // forward() pass; exposed publicly so callers (and tests) can warm the
+    // cache for known bucket shapes ahead of time.
+    Tensor pos_emb(int seq_len, int d_model, DType dtype,
+                   Device device) const;
+
+    // Number of distinct (seq_len, d_model, dtype, device) tuples currently
+    // memoised. Exposed for diagnostics + WAS-28 regression tests;
+    // consumers do not depend on entry-level details.
+    size_t pos_emb_cache_size() const { return pos_emb_cache_.size(); }
 
   private:
     EncoderConfig config_;
@@ -225,6 +248,42 @@ class FastConformerEncoder : public Module {
     ModuleList layers_;
 
     bool is_int8_ = false;
+
+    // Cache key for memoised sinusoidal_position_embedding results.
+    // (d_model, dtype, device) are effectively constant once the encoder is
+    // loaded, but we key on all four for correctness — test code constructs
+    // encoders with different configs in the same process.
+    struct PosEmbKey {
+        int seq_len;
+        int d_model;
+        DType dtype;
+        Device device;
+        bool operator==(const PosEmbKey &) const = default;
+    };
+    struct PosEmbKeyHash {
+        size_t operator()(const PosEmbKey &k) const noexcept {
+            // boost::hash_combine pattern.
+            auto mix = [](size_t h, size_t v) {
+                return h ^ (v + 0x9e3779b9 + (h << 6) + (h >> 2));
+            };
+            size_t h = std::hash<int>{}(k.seq_len);
+            h = mix(h, std::hash<int>{}(k.d_model));
+            h = mix(h, std::hash<int>{}(static_cast<int>(k.dtype)));
+            h = mix(h, std::hash<int>{}(static_cast<int>(k.device)));
+            return h;
+        }
+    };
+    // forward() is const so the cache must be mutable. Single-threaded by
+    // contract: parakeet engines serialise transcribe calls per instance.
+    //
+    // No eviction policy: cache size is bounded by the number of distinct
+    // (seq_len, d_model, dtype, device) tuples a caller feeds. Wasper's
+    // /transcribe path bucketing (WAS-13) keeps this tiny (~3-5 entries
+    // post-warmup); other consumers without bucketing could grow this
+    // arbitrarily. At d_model=1024, fp16, seq_len=3000 one entry is
+    // ~12 MB. If a non-bucketed consumer materialises, switch to LRU.
+    mutable std::unordered_map<PosEmbKey, Tensor, PosEmbKeyHash>
+        pos_emb_cache_;
 
     // Scans state_dict for _quantized keys and injects int8 weight pairs
     // into each ConformerBlock's sub-modules.
