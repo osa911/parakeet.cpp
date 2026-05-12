@@ -154,15 +154,41 @@ Tensor ConformerAttention::rel_position_attention(const Tensor &query,
                                                   const Tensor &mask) const {
     // query/key/value: (batch, seq, d_model)
     // pos_emb: (2*seq-1, d_model)
+    //
+    // WAS-28 PR #4a — inner-Attn signposts. PR #2's `Attn` signpost showed
+    // attention as 54.8% of encoder wall but said nothing about which of the
+    // 10 dispatchable ops below dominates. These nested signposts give the
+    // breakdown to pick the right lever (fused QKV, pos_proj cache,
+    // rel_shift kernel, fused softmax+score, etc.) for PR #4b.
+    //
+    // Bracing requirement (see signposts.hpp): each BEGIN/END pair lives in
+    // its own `{ }` block — the macros emit per-name local variables that
+    // would collide on a second BEGIN with the same name in the same scope.
+    // CPU-side caveat: the inner timings are CPU wall around command-buffer
+    // encoding; the GPU executes asynchronously between blocks. Pair with
+    // Metal System Trace for true GPU-side attribution.
 
     int num_heads = mha_.num_heads();
 
     // Project Q, K, V — Linear::forward() dispatches to int8_matmul
     // automatically when weight is Int8 + scale is loaded (WAS-27 fast path).
     // Bias is applied inside Linear::forward(), no explicit add needed here.
-    auto q = mha_.q_proj()(query);
-    auto k = mha_.k_proj()(key);
-    auto v = mha_.v_proj()(value);
+    Tensor q, k, v;
+    {
+        PARAKEET_SP_BEGIN(QProj);
+        q = mha_.q_proj()(query);
+        PARAKEET_SP_END(QProj);
+    }
+    {
+        PARAKEET_SP_BEGIN(KProj);
+        k = mha_.k_proj()(key);
+        PARAKEET_SP_END(KProj);
+    }
+    {
+        PARAKEET_SP_BEGIN(VProj);
+        v = mha_.v_proj()(value);
+        PARAKEET_SP_END(VProj);
+    }
 
     auto d_model = static_cast<int>(q.shape().back());
     int head_dim = d_model / num_heads;
@@ -185,40 +211,73 @@ Tensor ConformerAttention::rel_position_attention(const Tensor &query,
     auto bias_v = pos_bias_v_.reshape({1, nh, 1, hd});
 
     // Content attention: (Q + pos_bias_u) @ K^T → (batch, heads, seq, seq)
-    auto content_score = ops::matmul(q + bias_u, k, false, true);
+    Tensor content_score;
+    {
+        PARAKEET_SP_BEGIN(ContentScore);
+        content_score = ops::matmul(q + bias_u, k, false, true);
+        PARAKEET_SP_END(ContentScore);
+    }
 
     // Position attention: project position embeddings
-    auto p = pos_proj_(pos_emb); // (2*seq-1, d_model)
+    Tensor p;
+    {
+        PARAKEET_SP_BEGIN(PosProj);
+        p = pos_proj_(pos_emb); // (2*seq-1, d_model)
+        PARAKEET_SP_END(PosProj);
+    }
     auto pos_len = p.shape()[0];
     // Reshape to (1, 2*seq-1, heads, head_dim) → (1, heads, 2*seq-1, head_dim)
     p = p.reshape({1, pos_len, nh, hd}).transpose({0, 2, 1, 3});
 
     // (Q + pos_bias_v) @ P^T → (batch, heads, seq, 2*seq-1)
-    auto pos_score = ops::matmul(q + bias_v, p, false, true);
-
-    // Shift to align relative positions
-    pos_score = rel_shift(pos_score);
-
-    // Combined scores
-    auto scores = (content_score + pos_score) * scale;
-
-    // Apply mask if present
-    if (mask.storage()) {
-        scores = ops::masked_fill(scores, mask, -1e9f);
+    Tensor pos_score;
+    {
+        PARAKEET_SP_BEGIN(PosScore);
+        pos_score = ops::matmul(q + bias_v, p, false, true);
+        PARAKEET_SP_END(PosScore);
     }
 
-    // Softmax over last dim
-    auto attn_weights = ops::softmax(scores, -1);
+    // Shift to align relative positions
+    {
+        PARAKEET_SP_BEGIN(RelShift);
+        pos_score = rel_shift(pos_score);
+        PARAKEET_SP_END(RelShift);
+    }
+
+    // Combined scores + optional mask + softmax. Grouped under one signpost
+    // because they're a contiguous chain dominated by the softmax cost; if
+    // the trace shows this phase is the dominant lever, we can split later
+    // to discriminate softmax from the add/scale/mask_fill prelude.
+    Tensor attn_weights;
+    {
+        PARAKEET_SP_BEGIN(Softmax);
+        auto scores = (content_score + pos_score) * scale;
+        if (mask.storage()) {
+            scores = ops::masked_fill(scores, mask, -1e9f);
+        }
+        attn_weights = ops::softmax(scores, -1);
+        PARAKEET_SP_END(Softmax);
+    }
 
     // Weighted sum: (batch, heads, seq, head_dim)
-    auto out = ops::matmul(attn_weights, v);
+    Tensor out;
+    {
+        PARAKEET_SP_BEGIN(AttnMatmul);
+        out = ops::matmul(attn_weights, v);
+        PARAKEET_SP_END(AttnMatmul);
+    }
 
     // Reshape back: (batch, seq, d_model)
     out = out.transpose({0, 2, 1, 3});
     out = out.reshape({batch, seq_len, static_cast<size_t>(d_model)});
 
     // Output projection — Linear::forward() handles int8 dispatch automatically.
-    return mha_.out_proj()(out);
+    {
+        PARAKEET_SP_BEGIN(OutProj);
+        out = mha_.out_proj()(out);
+        PARAKEET_SP_END(OutProj);
+    }
+    return out;
 }
 
 Tensor ConformerAttention::forward(const Tensor &input, const Tensor &pos_emb,
