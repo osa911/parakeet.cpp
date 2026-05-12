@@ -84,11 +84,12 @@ Tensor ConformerConvModule::forward(const Tensor &input) const {
 ConformerAttention::ConformerAttention(int num_heads, float dropout)
     : mha_(num_heads), qkv_proj_(/*bias=*/true), pos_proj_(false),
       dropout_(dropout) {
-    // qkv_proj_ comes BEFORE mha_ here in registration order so that when
-    // load_state_dict's key-remap (below) routes the concatenated q/k/v
-    // weight to "qkv_proj_.weight", the base-class recursion still iterates
-    // submodules deterministically — does not affect correctness, only
-    // matches the order tensors appear in the new state_dict layout.
+    // Registration order is mostly cosmetic — registered submodules are
+    // visited in insertion order by Module::load_state_dict and
+    // Module::to(...), but base behavior is order-independent for a
+    // well-formed state_dict (std::map lookup is keyed, not indexed).
+    // qkv_proj_ comes BEFORE mha_ to make `named_parameters()`
+    // introspection list the new fused weight first.
     AX_REGISTER_MODULES(norm_, qkv_proj_, mha_, pos_proj_, dropout_);
     AX_REGISTER_PARAMETERS(pos_bias_u_, pos_bias_v_);
 }
@@ -96,22 +97,24 @@ ConformerAttention::ConformerAttention(int num_heads, float dropout)
 void ConformerAttention::load_state_dict(
     const std::map<std::string, Tensor> &state_dict,
     const std::string &prefix, bool strict) {
-    // The on-disk safetensors layout still has three separate
+    // The on-disk safetensors layout has three separate
     //   <prefix>mha_.q_proj.weight
     //   <prefix>mha_.k_proj.weight
     //   <prefix>mha_.v_proj.weight
     // (plus matching .bias if present). The fused qkv_proj_ submodule
-    // registers a single "qkv_proj_.weight" parameter — base
-    // Module::load_state_dict would look for that key and fail (strict)
-    // or silently skip (non-strict). Either way it would NOT populate
-    // qkv_proj_'s weight from the existing checkpoint.
+    // registers a single "qkv_proj_.weight" parameter — without this
+    // override, base load_state_dict with strict=false would silently skip
+    // qkv_proj_.weight (no matching key) AND load the three mha_.q/k/v
+    // keys into Linears that are never on the forward path. Result: a
+    // model that runs forward through empty qkv_proj_ → garbage output,
+    // PLUS 3× memory waste in mha_'s q/k/v Linears.
     //
-    // This override builds a remapped state_dict where the three q/k/v
-    // weights (and biases if present) are concatenated row-wise into a
-    // single qkv_proj_.weight key, then delegates to base. mha_'s
-    // q_proj_/k_proj_/v_proj_ Linears stay registered but their weight_
-    // tensors never get storage allocated — keys for them are absent from
-    // the remapped dict.
+    // The override builds a remapped state_dict with the three q/k/v
+    // weights concatenated row-wise into a single qkv_proj_.weight key
+    // (and qkv_proj_.bias if biases are present), then delegates to
+    // base. mha_'s q_proj_/k_proj_/v_proj_ Linears stay registered for
+    // base Module::to(Device) recursion but their weight_ tensors never
+    // get storage — keys for them are absent from the remapped dict.
     auto qkv_prefix = prefix; // shorthand
     auto qw_key = qkv_prefix + "mha_.q_proj.weight";
     auto kw_key = qkv_prefix + "mha_.k_proj.weight";
@@ -132,11 +135,33 @@ void ConformerAttention::load_state_dict(
         else                    remapped.emplace(key, value);
     }
 
-    if (q_w.storage() && k_w.storage() && v_w.storage()) {
+    // q/k/v weights are an all-or-nothing set — a partial set means a
+    // malformed checkpoint. Surface loudly rather than silently dropping
+    // some keys and producing wrong forward output. Same rule for biases.
+    int w_count = static_cast<int>(q_w.storage() != nullptr) +
+                  static_cast<int>(k_w.storage() != nullptr) +
+                  static_cast<int>(v_w.storage() != nullptr);
+    if (w_count != 0 && w_count != 3) {
+        throw axiom::RuntimeError(
+            "ConformerAttention::load_state_dict: incomplete q/k/v.weight "
+            "set in state_dict — expected all three or none, got " +
+            std::to_string(w_count) + " of 3 for prefix '" + prefix + "'");
+    }
+    int b_count = static_cast<int>(q_b.storage() != nullptr) +
+                  static_cast<int>(k_b.storage() != nullptr) +
+                  static_cast<int>(v_b.storage() != nullptr);
+    if (b_count != 0 && b_count != 3) {
+        throw axiom::RuntimeError(
+            "ConformerAttention::load_state_dict: incomplete q/k/v.bias "
+            "set in state_dict — expected all three or none, got " +
+            std::to_string(b_count) + " of 3 for prefix '" + prefix + "'");
+    }
+
+    if (w_count == 3) {
         remapped[qkv_prefix + "qkv_proj_.weight"] =
             Tensor::cat({q_w, k_w, v_w}, /*axis=*/0);
     }
-    if (q_b.storage() && k_b.storage() && v_b.storage()) {
+    if (b_count == 3) {
         remapped[qkv_prefix + "qkv_proj_.bias"] =
             Tensor::cat({q_b, k_b, v_b}, /*axis=*/0);
     }
@@ -224,16 +249,14 @@ Tensor ConformerAttention::rel_position_attention(const Tensor &query,
 
     int num_heads = mha_.num_heads();
 
-    // Fused Q/K/V projection — WAS-28 PR #4b. Replaces 3 Linear int8 matmul
-    // dispatches with 1. In self-attention (query == key == value) the
-    // outputs of the 3 separate projections are produced by a single fused
-    // matmul with weight (3*d_model, d_model); the row layout matches the
-    // q/k/v concat in load_int8_weights / load_state_dict.
+    // Fused Q/K/V projection — WAS-28 PR #4b. Replaces 3 separate int8
+    // Linear matmul dispatches with 1, where each row stripe of the fused
+    // weight matches the q/k/v concat order in load_int8_weights /
+    // load_state_dict.
     //
-    // The 5-D reshape after the matmul bakes the q/k/v split into the
-    // multi-head reshape — avoids 3 contiguity copies a per-tensor
-    // `.slice()` would force. (key, value) args are unused for self-
-    // attention; the signature stays for caller compatibility.
+    // Self-attention (query == key == value) is the only call pattern.
+    // (key, value) args are kept for caller compatibility but unused —
+    // caller MUST pass query==key==value.
     (void)key;
     (void)value;
     Tensor qkv;
@@ -253,8 +276,14 @@ Tensor ConformerAttention::rel_position_attention(const Tensor &query,
     auto hd = static_cast<size_t>(head_dim);
 
     // (B, T, 3*d_model) → (B, T, 3, heads, head_dim) → permute to
-    // (3, B, heads, T, head_dim) so each q/k/v is a contiguous view of one
-    // outer slice.
+    // (3, B, heads, T, head_dim) so each q/k/v occupies one outer slice.
+    // The downstream `.slice(...).reshape({batch, nh, seq_len, hd})`
+    // chain produces the same final (B, heads, T, head_dim) tensor the
+    // unfused code did; the materialisation cost of those reshapes is
+    // not the win here. The win is the SINGLE int8 matmul dispatch
+    // above instead of three — reducing CPU encoding overhead per
+    // attention block (per WAS-28 PR #4a trace, QKV combined was 36.5%
+    // of Attn CPU dispatch).
     Tensor q, k, v;
     {
         PARAKEET_SP_BEGIN(QKVSplit);

@@ -2336,14 +2336,15 @@ TEST(Int8DeviceCoercion, ConformerAttentionToGPU) {
     // recursion reaches all of them automatically.
     attn.to(Device::GPU);
 
-    // Broad predicate — covers all 8 tensors (q/k/v/o int8 weights + per-block
-    // scales). The single-field accessor only observes q_proj's scale, so it
-    // would miss a regression that skipped migration of any k/v/o field.
+    // Broad predicate — after WAS-28 PR #4b's QKV fusion, covers 4 tensors
+    // (qkv_proj's int8 weight + scale, out_proj's int8 weight + scale). The
+    // single-field accessor only observes qkv_proj's scale, so it would
+    // miss a regression that skipped migration of out_proj's fields.
     EXPECT_TRUE(attn.all_int8_on(Device::GPU))
         << "Base Module::to(Device::GPU) failed to migrate one of the "
-           "q/k/v/out_proj int8 weight or fp16 scale tensors inside mha_ — "
-           "check that Linear::load_int8_weights registers scale_ as a Module "
-           "parameter. q_proj scale device: "
+           "qkv_proj/out_proj int8 weight or fp16 scale tensors — check "
+           "that Linear::load_int8_weights registers scale_ as a Module "
+           "parameter. qkv_proj scale device: "
         << static_cast<int>(attn.int8_weights_device());
 #endif
 }

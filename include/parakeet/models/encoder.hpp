@@ -123,6 +123,13 @@ class ConformerAttention : public Module {
     // of load_state_dict below remaps q/k/v.weight keys into qkv_proj_.weight
     // via row-wise concat before delegating to base, so 1× memory.
     // mha_.out_proj_ continues to be loaded normally (out is not fused).
+    //
+    // **DO NOT** introduce `mha_.q_proj()(x)` / `k_proj()(x)` / `v_proj()(x)`
+    // calls inside ConformerAttention::forward or rel_position_attention —
+    // those Linears are intentionally empty; use qkv_proj_(...) and the
+    // 5-D split instead. (Other classes that own their own MultiHeadAttention,
+    // e.g. TransformerBlock, are unaffected — their q/k/v_proj_ Linears are
+    // loaded normally and remain on their forward paths.)
     const Linear &qkv_proj() const { return qkv_proj_; }
 
     // Overrides Module::load_state_dict to redirect q/k/v.weight keys into a
