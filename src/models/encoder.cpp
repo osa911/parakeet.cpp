@@ -6,6 +6,8 @@
 #include <axiom/error.hpp>
 #include <axiom/nn/positional.hpp>
 
+#include "parakeet/profile/signposts.hpp"
+
 namespace parakeet::models {
 
 // ─── FeedForward ────────────────────────────────────────────────────────────
@@ -262,11 +264,36 @@ void ConformerBlock::load_int8_weights(
 
 Tensor ConformerBlock::forward(const Tensor &input, const Tensor &pos_emb,
                                const Tensor &mask) const {
-    auto x = ffn1_(input);
-    x = attn_(x, pos_emb, mask);
-    x = conv_(x);
-    x = ffn2_(x);
-    x = final_norm_(x);
+    // Signposts: Instruments aggregates by literal name → across 18 blocks,
+    // "FFN1" sums to total FFN1 wall-time, etc. Each PARAKEET_SP_BEGIN
+    // defines its own scoped variables (token-pasted from the identifier)
+    // so we use { } blocks to keep scopes clean.
+    Tensor x;
+    {
+        PARAKEET_SP_BEGIN(FFN1);
+        x = ffn1_(input);
+        PARAKEET_SP_END(FFN1);
+    }
+    {
+        PARAKEET_SP_BEGIN(Attn);
+        x = attn_(x, pos_emb, mask);
+        PARAKEET_SP_END(Attn);
+    }
+    {
+        PARAKEET_SP_BEGIN(Conv);
+        x = conv_(x);
+        PARAKEET_SP_END(Conv);
+    }
+    {
+        PARAKEET_SP_BEGIN(FFN2);
+        x = ffn2_(x);
+        PARAKEET_SP_END(FFN2);
+    }
+    {
+        PARAKEET_SP_BEGIN(BlockFinalNorm);
+        x = final_norm_(x);
+        PARAKEET_SP_END(BlockFinalNorm);
+    }
     return x;
 }
 
@@ -396,17 +423,44 @@ void FastConformerEncoder::load_int8_weights_(
 
 Tensor FastConformerEncoder::forward(const Tensor &input,
                                      const Tensor &mask) const {
-    auto x = subsampling_(input);
+    // Top-level encoder phase signposts. Inner ConformerBlock::forward
+    // emits FFN1/Attn/Conv/FFN2/BlockFinalNorm signposts; those nest
+    // inside ConformerBlocks so Instruments shows the hierarchy.
+    //
+    // Attribution caveat: only the outer Encoder interval is GPU-
+    // inclusive (the call returns after the final GPU sync that
+    // materializes the output tensor). Inner intervals measure CPU-
+    // side wall around command-buffer encoding ops; the actual GPU
+    // execution happens asynchronously between blocks. Pair with the
+    // Metal System Trace instrument for true GPU-side attribution.
+    PARAKEET_SP_BEGIN(Encoder);
 
-    // Generate sinusoidal position embeddings for the sequence length
+    Tensor x;
+    {
+        PARAKEET_SP_BEGIN(Subsampling);
+        x = subsampling_(input);
+        PARAKEET_SP_END(Subsampling);
+    }
+
     int seq_len = static_cast<int>(x.shape()[1]);
     int d_model = static_cast<int>(x.shape()[2]);
-    auto pos_emb = axiom::nn::sinusoidal_position_embedding(
-        seq_len, d_model, x.dtype(), x.device());
-
-    for (const auto &block : layers_.each<ConformerBlock>()) {
-        x = block(x, pos_emb, mask);
+    Tensor pos_emb;
+    {
+        PARAKEET_SP_BEGIN(PosEmb);
+        pos_emb = axiom::nn::sinusoidal_position_embedding(
+            seq_len, d_model, x.dtype(), x.device());
+        PARAKEET_SP_END(PosEmb);
     }
+
+    {
+        PARAKEET_SP_BEGIN(ConformerBlocks);
+        for (const auto &block : layers_.each<ConformerBlock>()) {
+            x = block(x, pos_emb, mask);
+        }
+        PARAKEET_SP_END(ConformerBlocks);
+    }
+
+    PARAKEET_SP_END(Encoder);
     return x;
 }
 
