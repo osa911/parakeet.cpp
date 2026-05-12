@@ -25,11 +25,27 @@ using axiom::Tensor;
 //
 // Builds on the axiom L1 parity test (test_int8_matmul_mpsmm_parity) by
 // exercising dispatch through the public nn::Linear API rather than via direct
-// ops::int8_matmul calls. Exercises both the FFN-expand shape (1900x1024x4096)
-// and the QKVO shape (1900x1024x1024) from Parakeet TDT-0.6b-v3.
+// ops::int8_matmul calls. Exercises the FFN-expand shape (1900x1024x4096),
+// the QKVO shape (1900x1024x1024), and the FFN-contract shape (1900x4096x1024)
+// from Parakeet TDT-0.6b-v3.
+
+// RAII env var guard — ensures AXIOM_FORCE_LAZY_LINEAR is cleared on scope
+// exit even if forward() throws. Without this, a regression that crashes
+// during the lazy-path forward() would leak the env var into subsequent tests
+// in the same binary.
+struct ScopedLazyEnv {
+    explicit ScopedLazyEnv(bool on) {
+        if (on) setenv("AXIOM_FORCE_LAZY_LINEAR", "1", 1);
+        else    unsetenv("AXIOM_FORCE_LAZY_LINEAR");
+    }
+    ~ScopedLazyEnv() { unsetenv("AXIOM_FORCE_LAZY_LINEAR"); }
+};
 
 // Block-symmetric int8 quantization, block=32 along K dim (Phase 1 scheme).
 // Returns {weight_int8 [N,K] int8, scale_fp16 [N, K/32] fp16}.
+//
+// NOTE: duplicated from axiom's L1 test helper. Update both copies in tandem
+// if the Phase 1 quant scheme (block size, clamp range) ever changes.
 struct QuantPair {
     Tensor weight_int8;
     Tensor scale_fp16;
@@ -126,19 +142,34 @@ TEST_F(LinearInt8MpsmmParityTest, FFNExpandShapeParity) {
     state["bias"] = bias;
     linear.load_state_dict(state, "", /*strict=*/false);
 
-    // Path A: env var unset → dequant+MPSMM fast path.
-    unsetenv("AXIOM_FORCE_LAZY_LINEAR");
-    auto out_fast = linear.forward(input);
-
-    // Path B: force legacy lazy path via env var.
-    setenv("AXIOM_FORCE_LAZY_LINEAR", "1", 1);
-    auto out_lazy = linear.forward(input);
-    unsetenv("AXIOM_FORCE_LAZY_LINEAR");
+    Tensor out_fast, out_lazy;
+    {
+        ScopedLazyEnv guard(false);
+        out_fast = linear.forward(input);
+    }
+    {
+        ScopedLazyEnv guard(true);
+        out_lazy = linear.forward(input);
+    }
 
     EXPECT_EQ(out_fast.shape(), out_lazy.shape());
     float rel_err = max_relative_error_fp16(out_fast, out_lazy);
     EXPECT_LE(rel_err, 1e-3f)
         << "FFN expand parity failed: max relative error " << rel_err;
+
+    // Sanity check: bias was actually applied (catches a future regression
+    // that drops the bias-add from Linear::forward — would still pass parity
+    // since both fast and lazy paths would be equally bias-less).
+    axiom::nn::Linear linear_nobias(/*bias=*/false);
+    linear_nobias.load_int8_weights(qp.weight_int8, qp.scale_fp16);
+    Tensor out_nobias;
+    {
+        ScopedLazyEnv guard(false);
+        out_nobias = linear_nobias.forward(input);
+    }
+    float diff = max_relative_error_fp16(out_fast, out_nobias);
+    EXPECT_GT(diff, 1e-3f) << "bias appears to have been dropped: out_fast and "
+                               "out_nobias indistinguishable within 1e-3";
 }
 
 TEST_F(LinearInt8MpsmmParityTest, QKVOShapeParity) {
@@ -163,19 +194,86 @@ TEST_F(LinearInt8MpsmmParityTest, QKVOShapeParity) {
     state["bias"] = bias;
     linear.load_state_dict(state, "", /*strict=*/false);
 
-    // Path A: env var unset → dequant+MPSMM fast path.
-    unsetenv("AXIOM_FORCE_LAZY_LINEAR");
-    auto out_fast = linear.forward(input);
-
-    // Path B: force legacy lazy path via env var.
-    setenv("AXIOM_FORCE_LAZY_LINEAR", "1", 1);
-    auto out_lazy = linear.forward(input);
-    unsetenv("AXIOM_FORCE_LAZY_LINEAR");
+    Tensor out_fast, out_lazy;
+    {
+        ScopedLazyEnv guard(false);
+        out_fast = linear.forward(input);
+    }
+    {
+        ScopedLazyEnv guard(true);
+        out_lazy = linear.forward(input);
+    }
 
     EXPECT_EQ(out_fast.shape(), out_lazy.shape());
     float rel_err = max_relative_error_fp16(out_fast, out_lazy);
     EXPECT_LE(rel_err, 1e-3f)
         << "QKVO parity failed: max relative error " << rel_err;
+
+    // Sanity check: bias was actually applied (catches a future regression
+    // that drops the bias-add from Linear::forward — would still pass parity
+    // since both fast and lazy paths would be equally bias-less).
+    axiom::nn::Linear linear_nobias(/*bias=*/false);
+    linear_nobias.load_int8_weights(qp.weight_int8, qp.scale_fp16);
+    Tensor out_nobias;
+    {
+        ScopedLazyEnv guard(false);
+        out_nobias = linear_nobias.forward(input);
+    }
+    float diff = max_relative_error_fp16(out_fast, out_nobias);
+    EXPECT_GT(diff, 1e-3f) << "bias appears to have been dropped: out_fast and "
+                               "out_nobias indistinguishable within 1e-3";
+}
+
+TEST_F(LinearInt8MpsmmParityTest, FFNContractShapeParity) {
+    // FFN contract shape from Parakeet TDT-0.6b-v3 (hidden=1024, ffn=4096).
+    // M=1900, K=4096, N=1024
+    constexpr size_t M = 1900, K = 4096, N = 1024;
+
+    auto input = Tensor::randn({M, K}, DType::Float32, Device::CPU)
+                     .astype(DType::Float16)
+                     .to(Device::GPU);
+
+    auto w_fp32 = Tensor::randn({N, K}, DType::Float32, Device::CPU);
+    auto qp = quantize_block_symmetric_k32(w_fp32);
+
+    auto bias = Tensor::randn({N}, DType::Float32, Device::CPU)
+                    .astype(DType::Float16)
+                    .to(Device::GPU);
+
+    axiom::nn::Linear linear(/*bias=*/true);
+    linear.load_int8_weights(qp.weight_int8, qp.scale_fp16);
+    std::map<std::string, Tensor> state;
+    state["bias"] = bias;
+    linear.load_state_dict(state, "", /*strict=*/false);
+
+    Tensor out_fast, out_lazy;
+    {
+        ScopedLazyEnv guard(false);
+        out_fast = linear.forward(input);
+    }
+    {
+        ScopedLazyEnv guard(true);
+        out_lazy = linear.forward(input);
+    }
+
+    EXPECT_EQ(out_fast.shape(), out_lazy.shape());
+    float rel_err = max_relative_error_fp16(out_fast, out_lazy);
+    EXPECT_LE(rel_err, 1e-3f)
+        << "FFN contract parity failed: max relative error " << rel_err;
+
+    // Sanity check: bias was actually applied (catches a future regression
+    // that drops the bias-add from Linear::forward — would still pass parity
+    // since both fast and lazy paths would be equally bias-less).
+    axiom::nn::Linear linear_nobias(/*bias=*/false);
+    linear_nobias.load_int8_weights(qp.weight_int8, qp.scale_fp16);
+    Tensor out_nobias;
+    {
+        ScopedLazyEnv guard(false);
+        out_nobias = linear_nobias.forward(input);
+    }
+    float diff = max_relative_error_fp16(out_fast, out_nobias);
+    EXPECT_GT(diff, 1e-3f) << "bias appears to have been dropped: out_fast and "
+                               "out_nobias indistinguishable within 1e-3";
 }
 
 } // namespace
