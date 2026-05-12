@@ -19,7 +19,7 @@ void FeedForward::load_int8_weights(Tensor fc1_w_int8, Tensor fc1_w_scale,
                                     Tensor fc2_w_int8, Tensor fc2_w_scale) {
     fc1_.load_int8_weights(fc1_w_int8, fc1_w_scale);
     fc2_.load_int8_weights(fc2_w_int8, fc2_w_scale);
-    is_int8_ = true;
+    // is_int8() is now derived from fc1_.has_scale() + dtype; no flag to set.
 }
 
 Device FeedForward::int8_weights_device() const {
@@ -96,7 +96,7 @@ void ConformerAttention::load_int8_weights(Tensor q_int8, Tensor q_scale,
     const_cast<Linear &>(mha_.k_proj()).load_int8_weights(k_int8, k_scale);
     const_cast<Linear &>(mha_.v_proj()).load_int8_weights(v_int8, v_scale);
     const_cast<Linear &>(mha_.out_proj()).load_int8_weights(o_int8, o_scale);
-    is_int8_ = true;
+    // is_int8() is now derived from mha_.q_proj().has_scale() + dtype; no flag to set.
 }
 
 Device ConformerAttention::int8_weights_device() const {

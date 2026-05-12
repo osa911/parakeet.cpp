@@ -28,7 +28,13 @@ class FeedForward : public Module {
     void load_int8_weights(Tensor fc1_w_int8, Tensor fc1_w_scale,
                            Tensor fc2_w_int8, Tensor fc2_w_scale);
 
-    bool is_int8() const { return is_int8_; }
+    // Derived from primary state: true iff fc1_'s weight is Int8 and its
+    // scale_ parameter is loaded. No separate bool field — eliminates the
+    // stale-state hazard where reloading fp16 weights after int8 would leave
+    // a cached bool returning true.
+    bool is_int8() const {
+        return fc1_.has_scale() && fc1_.weight().dtype() == DType::Int8;
+    }
 
     // Test/diagnostic helper: device of fc1_'s scale tensor (or CPU if not
     // loaded). Used to verify Module::to(Device) migrated the int8 fields.
@@ -50,8 +56,6 @@ class FeedForward : public Module {
     Linear fc1_;
     Linear fc2_;
     Dropout dropout_;
-
-    bool is_int8_ = false;
 };
 
 // ─── Conformer Convolution Module ───────────────────────────────────────────
@@ -92,7 +96,13 @@ class ConformerAttention : public Module {
                            Tensor k_scale, Tensor v_int8, Tensor v_scale,
                            Tensor o_int8, Tensor o_scale);
 
-    bool is_int8() const { return is_int8_; }
+    // Derived from primary state: true iff mha_'s q_proj weight is Int8 and
+    // its scale_ parameter is loaded. No separate bool field — same rationale
+    // as FeedForward::is_int8().
+    bool is_int8() const {
+        return mha_.q_proj().has_scale() &&
+               mha_.q_proj().weight().dtype() == DType::Int8;
+    }
 
     // Test/diagnostic helper — see FeedForward::int8_weights_device().
     // Returns device of q_proj's scale tensor (or CPU if not loaded).
@@ -110,8 +120,6 @@ class ConformerAttention : public Module {
     Dropout dropout_;
     Tensor pos_bias_u_; // (num_heads, head_dim) — learned position bias
     Tensor pos_bias_v_; // (num_heads, head_dim) — learned position bias
-
-    bool is_int8_ = false;
 
     // Relative position attention (bypasses mha_.forward)
     Tensor rel_position_attention(const Tensor &query, const Tensor &key,

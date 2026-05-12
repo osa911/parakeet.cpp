@@ -2067,22 +2067,18 @@ TEST(TDTBeamSearch, BeamWidth1) {
 //  WAS-19 Phase 1: int8 device coercion (FeedForward, ConformerAttention)
 // ═══════════════════════════════════════════════════════════════════════════════
 //
-// Bug under test: FeedForward and ConformerAttention store their int8 weights
-// (and fp16 per-block scales) as bare Tensor member fields, NOT as registered
-// Module parameters. axiom::nn::Module::to(Device) only walks registered
-// params_ + submodules_, so after `module.to(Device::GPU)` the bare int8
-// fields stay CPU-resident. The first ops::int8_matmul call then dispatches
-// gpu_int8_matmul which fails because the weight tensor is still on CPU.
+// Post-WAS-27 refactor: int8 weights are no longer stored as bare Tensor member
+// fields. Linear::load_int8_weights() registers scale_ as a Module parameter
+// (via AX_REGISTER_PARAMETERS), so the standard base Module::to(Device)
+// recursion migrates weight_ and scale_ alongside all other registered params_
+// and submodules_. No class-level to(Device) overrides exist in FeedForward or
+// ConformerAttention — the base implementation is sufficient.
 //
-// Direct verification: load int8 weights on CPU, call to(Device::GPU), then
-// observe the device of the bare int8 weight tensor via the diagnostic
-// accessor int8_weights_device(). On the buggy build the accessor returns
-// Device::CPU; after the fix it returns Device::GPU.
-//
-// Also exercises ConformerBlock::to(Device) to verify the base-class
-// Module::to() dispatches virtually to the FeedForward/ConformerAttention
-// overrides through its registered submodules — no ConformerBlock-level
-// override is required.
+// These tests verify that the base Module::to(Device) recursion correctly
+// migrates all Linear int8 weight + scale tensors when the enclosing module
+// is moved to GPU. The diagnostic accessor int8_weights_device() is used to
+// observe the device of a canary scale tensor; all_int8_on(Device) is used
+// for broad coverage across all int8 fields.
 
 TEST(Int8DeviceCoercion, FeedForwardToGPU) {
 #ifndef AXIOM_METAL_SUPPORT
@@ -2109,20 +2105,21 @@ TEST(Int8DeviceCoercion, FeedForwardToGPU) {
     ASSERT_EQ(ff.int8_weights_device(), Device::CPU);
     ASSERT_TRUE(ff.all_int8_on(Device::CPU));
 
-    // Move FeedForward to GPU. With the buggy base Module::to(Device) the
-    // bare int8 fields are skipped (only registered params_ + submodules_ are
-    // visited). The override in FeedForward::to(Device) walks the int8 fields
-    // explicitly so they end up on GPU.
+    // Move FeedForward to GPU. Linear::load_int8_weights() registers scale_ as
+    // a Module parameter (via load_int8_weights → AX_REGISTER_PARAMETERS), so
+    // the base Module::to(Device) recursion migrates weight_ and scale_
+    // alongside all other registered params_ and submodules_. No
+    // FeedForward::to(Device) override is needed or present.
     ff.to(Device::GPU);
 
-    // Use the broad predicate so a regression that breaks the migration of
-    // any single field (e.g. fc2_w_int8_ or either scale) fails the test —
-    // the single-field `int8_weights_device()` only observes fc1_w_int8_.
+    // Use the broad predicate so a regression that breaks migration of any
+    // single field (e.g. fc2_'s weight or scale) fails the test — the single-
+    // field accessor int8_weights_device() only observes fc1_'s scale.
     EXPECT_TRUE(ff.all_int8_on(Device::GPU))
-        << "FeedForward::to(Device::GPU) failed to migrate one of the bare "
-           "fc1/fc2 int8 weight + fp16 scale fields — Module::to() only "
-           "iterates registered params_, so the override in FeedForward must "
-           "walk EVERY int8 field explicitly. fc1_w_int8_ device: "
+        << "Base Module::to(Device::GPU) failed to migrate one of the "
+           "fc1_/fc2_ int8 weight or fp16 scale tensors — check that "
+           "Linear::load_int8_weights registers scale_ as a Module parameter. "
+           "fc1_ scale device: "
         << static_cast<int>(ff.int8_weights_device());
 #endif
 }
@@ -2152,19 +2149,31 @@ TEST(Int8DeviceCoercion, ConformerAttentionToGPU) {
     ASSERT_EQ(attn.int8_weights_device(), Device::CPU);
     ASSERT_TRUE(attn.all_int8_on(Device::CPU));
 
+    // Same mechanism as FeedForward: mha_'s q/k/v/out_proj are registered
+    // submodules of MultiHeadAttention; each Linear's scale_ is registered as
+    // a Module parameter inside load_int8_weights. Base Module::to(Device)
+    // recursion reaches all of them automatically.
     attn.to(Device::GPU);
 
-    // Broad predicate — covers all 8 fields (q/k/v/o int8 + per-block scales).
-    // The single-field accessor only observes q_w_int8_, so it would miss a
-    // regression that skipped any of k/v/o migrations or any scale.
+    // Broad predicate — covers all 8 tensors (q/k/v/o int8 weights + per-block
+    // scales). The single-field accessor only observes q_proj's scale, so it
+    // would miss a regression that skipped migration of any k/v/o field.
     EXPECT_TRUE(attn.all_int8_on(Device::GPU))
-        << "ConformerAttention::to(Device::GPU) failed to migrate one of the "
-           "bare q/k/v/out int8 weight + fp16 scale fields — same root cause "
-           "as FeedForward. q_w_int8_ device: "
+        << "Base Module::to(Device::GPU) failed to migrate one of the "
+           "q/k/v/out_proj int8 weight or fp16 scale tensors inside mha_ — "
+           "check that Linear::load_int8_weights registers scale_ as a Module "
+           "parameter. q_proj scale device: "
         << static_cast<int>(attn.int8_weights_device());
 #endif
 }
 
+// NOTE: the _VirtualDispatch suffix is historical — it was coined when the
+// test's premise was that Module::to() dispatches through class-level overrides
+// in FeedForward and ConformerAttention. Those overrides no longer exist.
+// The test now validates that base Module::to() recursion reaches the Linear
+// instances nested inside FeedForward and ConformerAttention submodules and
+// migrates their registered scale_ parameters. The test name is preserved for
+// git-blame continuity.
 TEST(Int8DeviceCoercion, ConformerBlockToGPU_VirtualDispatch) {
 #ifndef AXIOM_METAL_SUPPORT
     GTEST_SKIP() << "Metal/GPU not available — int8_matmul is GPU-only";
@@ -2173,11 +2182,11 @@ TEST(Int8DeviceCoercion, ConformerBlockToGPU_VirtualDispatch) {
     using parakeet::models::ConformerBlock;
     using parakeet::models::EncoderConfig;
 
-    // Verify ConformerBlock does NOT need its own to(Device) override:
-    // axiom::nn::Module::to(Device) is virtual, and the base implementation
-    // calls submodule->to(device) through a Module* pointer, so the most-
-    // derived overrides (FeedForward, ConformerAttention) are dispatched
-    // automatically when the block migrates.
+    // Verify ConformerBlock does NOT need its own to(Device) override.
+    // Base Module::to(Device) recurses into registered submodules (ffn1_,
+    // attn_, ffn2_), which in turn recurse into their registered Linear
+    // submodules. Each Linear's scale_ is a registered parameter, so it is
+    // migrated automatically — no class-level overrides required at any level.
 
     EncoderConfig cfg;
     cfg.hidden_size = 64;
@@ -2212,15 +2221,14 @@ TEST(Int8DeviceCoercion, ConformerBlockToGPU_VirtualDispatch) {
     block.to(Device::GPU);
 
     // ConformerBlock has no public int8 accessor, but the children do.
-    // Reaching into them through const-cast would be ugly; instead, we trust
-    // that if FeedForwardToGPU + ConformerAttentionToGPU pass, the virtual-
-    // dispatch wiring also works for the block (the block's submodules are
-    // exactly those types). This test exists to document the design choice
-    // and to fail loudly if anyone later breaks the virtual call in the base
-    // Module::to() (e.g. by switching to non-virtual dispatch).
-    SUCCEED() << "ConformerBlock relies on Module::to() virtual dispatch into "
-                 "FeedForward + ConformerAttention overrides; no block-level "
-                 "override needed.";
+    // If FeedForwardToGPU + ConformerAttentionToGPU pass, the base-recursion
+    // wiring also works for the block (its submodules are exactly those types).
+    // This test exists to document the design choice and to fail loudly if
+    // anyone later breaks base Module::to() recursion (e.g. by requiring
+    // explicit submodule registration of int8 tensors outside Linear).
+    SUCCEED() << "ConformerBlock relies on base Module::to() recursion into "
+                 "FeedForward + ConformerAttention registered submodules; "
+                 "no block-level override needed.";
 #endif
 }
 

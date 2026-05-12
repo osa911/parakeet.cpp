@@ -46,6 +46,7 @@ struct ScopedLazyEnv {
 //
 // NOTE: duplicated from axiom's L1 test helper. Update both copies in tandem
 // if the Phase 1 quant scheme (block size, clamp range) ever changes.
+// TODO(M4): hoist to axiom test utils when the post-WAS-27 cleanup PR lands.
 struct QuantPair {
     Tensor weight_int8;
     Tensor scale_fp16;
@@ -111,7 +112,17 @@ float max_relative_error_fp16(const Tensor &a, const Tensor &b) {
     return max_rel;
 }
 
-class LinearInt8MpsmmParityTest : public ::testing::Test {
+// ─── Parameterized fixture ────────────────────────────────────────────────────
+
+struct LinearParityParams {
+    size_t M;
+    size_t K;
+    size_t N;
+    const char *shape_name; // used in INSTANTIATE_TEST_SUITE_P naming
+};
+
+class LinearInt8MpsmmParityP
+    : public ::testing::TestWithParam<LinearParityParams> {
   protected:
     void SetUp() override {
         if (!axiom::system::should_run_gpu_tests()) {
@@ -120,10 +131,11 @@ class LinearInt8MpsmmParityTest : public ::testing::Test {
     }
 };
 
-TEST_F(LinearInt8MpsmmParityTest, FFNExpandShapeParity) {
-    // FFN expand shape from Parakeet TDT-0.6b-v3 (hidden=1024, ffn=4096).
-    // M=1900, K=1024, N=4096
-    constexpr size_t M = 1900, K = 1024, N = 4096;
+TEST_P(LinearInt8MpsmmParityP, ParityAndBiasSanity) {
+    const auto &p = GetParam();
+    const size_t M = p.M;
+    const size_t K = p.K;
+    const size_t N = p.N;
 
     auto input = Tensor::randn({M, K}, DType::Float32, Device::CPU)
                      .astype(DType::Float16)
@@ -155,7 +167,7 @@ TEST_F(LinearInt8MpsmmParityTest, FFNExpandShapeParity) {
     EXPECT_EQ(out_fast.shape(), out_lazy.shape());
     float rel_err = max_relative_error_fp16(out_fast, out_lazy);
     EXPECT_LE(rel_err, 1e-3f)
-        << "FFN expand parity failed: max relative error " << rel_err;
+        << p.shape_name << " parity failed: max relative error " << rel_err;
 
     // Sanity check: bias was actually applied (catches a future regression
     // that drops the bias-add from Linear::forward — would still pass parity
@@ -172,108 +184,18 @@ TEST_F(LinearInt8MpsmmParityTest, FFNExpandShapeParity) {
                                "out_nobias indistinguishable within 1e-3";
 }
 
-TEST_F(LinearInt8MpsmmParityTest, QKVOShapeParity) {
-    // QKVO shape from Parakeet TDT-0.6b-v3 (hidden=1024).
-    // M=1900, K=1024, N=1024
-    constexpr size_t M = 1900, K = 1024, N = 1024;
-
-    auto input = Tensor::randn({M, K}, DType::Float32, Device::CPU)
-                     .astype(DType::Float16)
-                     .to(Device::GPU);
-
-    auto w_fp32 = Tensor::randn({N, K}, DType::Float32, Device::CPU);
-    auto qp = quantize_block_symmetric_k32(w_fp32);
-
-    auto bias = Tensor::randn({N}, DType::Float32, Device::CPU)
-                    .astype(DType::Float16)
-                    .to(Device::GPU);
-
-    axiom::nn::Linear linear(/*bias=*/true);
-    linear.load_int8_weights(qp.weight_int8, qp.scale_fp16);
-    std::map<std::string, Tensor> state;
-    state["bias"] = bias;
-    linear.load_state_dict(state, "", /*strict=*/false);
-
-    Tensor out_fast, out_lazy;
-    {
-        ScopedLazyEnv guard(false);
-        out_fast = linear.forward(input);
-    }
-    {
-        ScopedLazyEnv guard(true);
-        out_lazy = linear.forward(input);
-    }
-
-    EXPECT_EQ(out_fast.shape(), out_lazy.shape());
-    float rel_err = max_relative_error_fp16(out_fast, out_lazy);
-    EXPECT_LE(rel_err, 1e-3f)
-        << "QKVO parity failed: max relative error " << rel_err;
-
-    // Sanity check: bias was actually applied (catches a future regression
-    // that drops the bias-add from Linear::forward — would still pass parity
-    // since both fast and lazy paths would be equally bias-less).
-    axiom::nn::Linear linear_nobias(/*bias=*/false);
-    linear_nobias.load_int8_weights(qp.weight_int8, qp.scale_fp16);
-    Tensor out_nobias;
-    {
-        ScopedLazyEnv guard(false);
-        out_nobias = linear_nobias.forward(input);
-    }
-    float diff = max_relative_error_fp16(out_fast, out_nobias);
-    EXPECT_GT(diff, 1e-3f) << "bias appears to have been dropped: out_fast and "
-                               "out_nobias indistinguishable within 1e-3";
-}
-
-TEST_F(LinearInt8MpsmmParityTest, FFNContractShapeParity) {
-    // FFN contract shape from Parakeet TDT-0.6b-v3 (hidden=1024, ffn=4096).
-    // M=1900, K=4096, N=1024
-    constexpr size_t M = 1900, K = 4096, N = 1024;
-
-    auto input = Tensor::randn({M, K}, DType::Float32, Device::CPU)
-                     .astype(DType::Float16)
-                     .to(Device::GPU);
-
-    auto w_fp32 = Tensor::randn({N, K}, DType::Float32, Device::CPU);
-    auto qp = quantize_block_symmetric_k32(w_fp32);
-
-    auto bias = Tensor::randn({N}, DType::Float32, Device::CPU)
-                    .astype(DType::Float16)
-                    .to(Device::GPU);
-
-    axiom::nn::Linear linear(/*bias=*/true);
-    linear.load_int8_weights(qp.weight_int8, qp.scale_fp16);
-    std::map<std::string, Tensor> state;
-    state["bias"] = bias;
-    linear.load_state_dict(state, "", /*strict=*/false);
-
-    Tensor out_fast, out_lazy;
-    {
-        ScopedLazyEnv guard(false);
-        out_fast = linear.forward(input);
-    }
-    {
-        ScopedLazyEnv guard(true);
-        out_lazy = linear.forward(input);
-    }
-
-    EXPECT_EQ(out_fast.shape(), out_lazy.shape());
-    float rel_err = max_relative_error_fp16(out_fast, out_lazy);
-    EXPECT_LE(rel_err, 1e-3f)
-        << "FFN contract parity failed: max relative error " << rel_err;
-
-    // Sanity check: bias was actually applied (catches a future regression
-    // that drops the bias-add from Linear::forward — would still pass parity
-    // since both fast and lazy paths would be equally bias-less).
-    axiom::nn::Linear linear_nobias(/*bias=*/false);
-    linear_nobias.load_int8_weights(qp.weight_int8, qp.scale_fp16);
-    Tensor out_nobias;
-    {
-        ScopedLazyEnv guard(false);
-        out_nobias = linear_nobias.forward(input);
-    }
-    float diff = max_relative_error_fp16(out_fast, out_nobias);
-    EXPECT_GT(diff, 1e-3f) << "bias appears to have been dropped: out_fast and "
-                               "out_nobias indistinguishable within 1e-3";
-}
+INSTANTIATE_TEST_SUITE_P(
+    LinearInt8MpsmParity,
+    LinearInt8MpsmmParityP,
+    ::testing::Values(
+        // QKVO shape from Parakeet TDT-0.6b-v3 (hidden=1024).
+        LinearParityParams{1900, 1024, 1024, "QKVO"},
+        // FFN expand shape from Parakeet TDT-0.6b-v3 (hidden=1024, ffn=4096).
+        LinearParityParams{1900, 1024, 4096, "FFNExpand"},
+        // FFN contract shape from Parakeet TDT-0.6b-v3 (hidden=1024, ffn=4096).
+        LinearParityParams{1900, 4096, 1024, "FFNContract"}),
+    [](const ::testing::TestParamInfo<LinearParityParams> &info) {
+        return info.param.shape_name;
+    });
 
 } // namespace
