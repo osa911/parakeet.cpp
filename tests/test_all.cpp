@@ -2184,6 +2184,83 @@ TEST(TDTBeamSearch, BeamWidth1) {
 // observe the device of a canary scale tensor; all_int8_on(Device) is used
 // for broad coverage across all int8 fields.
 
+// ─── WAS-28 PR #4b — Fused QKV ─────────────────────────────────────────────
+//
+// ConformerAttention previously dispatched Q, K, V as three separate
+// int8 Linear matmuls — 36.5% of Attn CPU dispatch (WAS-28 PR #4a trace).
+// PR #4b fuses them into a single (3*hidden, hidden) Linear loaded via
+// row-stripe concatenation of the q/k/v weights and scales. Output split
+// happens inside the multi-head reshape, avoiding contiguity copies.
+//
+// This test exercises the concatenation contract at load time: row stripes
+// [0, H), [H, 2H), [2H, 3H) of qkv_proj's weight must correspond to q, k,
+// v respectively. Behavioral parity (fused-forward output matches three-
+// separate-forward output within int8 quantization tolerance) is verified
+// by the existing Int8DeviceCoercion.ConformerAttentionForwardOnGPU and
+// the higher-level encoder-output parity tests.
+TEST(ConformerAttentionFusedQKV, LoadInt8ConcatenatesWeightsAlongOutputDim) {
+    using namespace axiom;
+    using parakeet::models::ConformerAttention;
+    using parakeet::models::EncoderConfig;
+
+    EncoderConfig cfg;
+    cfg.hidden_size = 64;
+    cfg.num_heads = 8;
+    cfg.dropout = 0.0f;
+
+    ConformerAttention attn(cfg.num_heads, cfg.dropout);
+
+    const size_t H = static_cast<size_t>(cfg.hidden_size);
+
+    // Distinctive int8 fill values per projection so the concat order is
+    // unambiguous from the resulting tensor. Values stay within int8 range.
+    auto i8_fill = [](size_t n, size_t k, int8_t v) {
+        return Tensor::full({n, k}, v);
+    };
+    auto sc_fill = [](size_t n, size_t k, uint16_t v) {
+        return Tensor::full({n, k / 32}, v).astype(DType::Float16);
+    };
+
+    attn.load_int8_weights(
+        i8_fill(H, H, 11), sc_fill(H, H, 1),  // q
+        i8_fill(H, H, 22), sc_fill(H, H, 2),  // k
+        i8_fill(H, H, 33), sc_fill(H, H, 3),  // v
+        i8_fill(H, H, 44), sc_fill(H, H, 4)); // o (separate from fused)
+
+    // qkv_proj is the new fused (3*H, H) Linear. Accessor is parakeet-side
+    // (added in PR #4b); does not exist on axiom's MultiHeadAttention.
+    const Linear &qkv = attn.qkv_proj();
+
+    ASSERT_EQ(qkv.weight().shape().size(), 2u);
+    EXPECT_EQ(qkv.weight().shape()[0], 3 * H);
+    EXPECT_EQ(qkv.weight().shape()[1], H);
+    EXPECT_EQ(qkv.weight().dtype(), DType::Int8);
+
+    // Row-stripe check on the weight: top H rows = q (11), next H = k (22),
+    // bottom H = v (33). out_proj is loaded separately on mha_.
+    auto w_cpu = qkv.weight().to(Device::CPU);
+    const int8_t *w = w_cpu.typed_data<int8_t>();
+    for (size_t i = 0; i < H; ++i) {
+        EXPECT_EQ(w[i * H + 0], 11) << "q stripe row " << i;
+        EXPECT_EQ(w[(H + i) * H + 0], 22) << "k stripe row " << i;
+        EXPECT_EQ(w[(2 * H + i) * H + 0], 33) << "v stripe row " << i;
+    }
+
+    // Same stripe check on the scale tensor — scale shape is (3*H, H/32).
+    ASSERT_TRUE(qkv.has_scale());
+    EXPECT_EQ(qkv.scale().shape()[0], 3 * H);
+    EXPECT_EQ(qkv.scale().shape()[1], H / 32);
+
+    auto s_cpu = qkv.scale().to(Device::CPU).astype(DType::Float32);
+    const float *s = s_cpu.typed_data<float>();
+    const size_t cols = H / 32;
+    for (size_t i = 0; i < H; ++i) {
+        EXPECT_NEAR(s[i * cols + 0], 1.0f, 1e-3f) << "q scale stripe row " << i;
+        EXPECT_NEAR(s[(H + i) * cols + 0], 2.0f, 1e-3f) << "k scale stripe row " << i;
+        EXPECT_NEAR(s[(2 * H + i) * cols + 0], 3.0f, 1e-3f) << "v scale stripe row " << i;
+    }
+}
+
 TEST(Int8DeviceCoercion, FeedForwardToGPU) {
 #ifndef AXIOM_METAL_SUPPORT
     GTEST_SKIP() << "Metal/GPU not available — int8_matmul is GPU-only";
