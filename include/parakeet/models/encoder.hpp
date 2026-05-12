@@ -218,6 +218,13 @@ class FastConformerEncoder : public Module {
                          const std::string &prefix = "",
                          bool strict = true) override;
 
+    // Overrides invalidate pos_emb_cache_: cached tensors carry the
+    // pre-migration dtype/device and would silently leak otherwise (never
+    // hit, never evicted). Matches the defensive pattern at FeedForward's
+    // is_int8() — same stale-state hazard class.
+    Module &to(Device device) override;
+    Module &to(DType dtype) override;
+
     // Returns true if int8 quantized weights were detected during the most
     // recent load_state_dict call. False if the encoder is running fp16.
     bool is_int8() const { return is_int8_; }
@@ -268,6 +275,13 @@ class FastConformerEncoder : public Module {
     };
     // forward() is const so the cache must be mutable. Single-threaded by
     // contract: parakeet engines serialise transcribe calls per instance.
+    //
+    // No eviction policy: cache size is bounded by the number of distinct
+    // (seq_len, d_model, dtype, device) tuples a caller feeds. Wasper's
+    // /transcribe path bucketing (WAS-13) keeps this tiny (~3-5 entries
+    // post-warmup); other consumers without bucketing could grow this
+    // arbitrarily. At d_model=1024, fp16, seq_len=3000 one entry is
+    // ~12 MB. If a non-bucketed consumer materialises, switch to LRU.
     mutable std::unordered_map<PosEmbKey, Tensor, PosEmbKeyHash>
         pos_emb_cache_;
 

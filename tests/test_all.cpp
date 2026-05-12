@@ -1042,8 +1042,11 @@ TEST(PositionEmbedding, CenterRow) {
 // Calls FastConformerEncoder::pos_emb() (the public entry point used by
 // forward()) and verifies the cache grows on miss, stays flat on hit, and
 // returns shape-correct tensors keyed by (seq_len, d_model, dtype, device).
+// Uses num_layers=1 for fast construction — the cache lives on
+// FastConformerEncoder itself, not on the conformer blocks.
 TEST(FastConformerEncoder, PosEmbCacheGrowsOnMissHoldsOnHit) {
     parakeet::models::EncoderConfig cfg;
+    cfg.num_layers = 1;
     parakeet::models::FastConformerEncoder enc(cfg);
 
     EXPECT_EQ(enc.pos_emb_cache_size(), 0u);
@@ -1069,6 +1072,38 @@ TEST(FastConformerEncoder, PosEmbCacheGrowsOnMissHoldsOnHit) {
     // Repeating the very first key still hits — no growth.
     (void)enc.pos_emb(10, 64, DType::Float32, Device::CPU);
     EXPECT_EQ(enc.pos_emb_cache_size(), 3u);
+}
+
+// Cache must be flushed when the encoder migrates dtype, device, or
+// reloads weights — otherwise pre-migration tensors become unhittable
+// garbage that grows over time. Mirrors the FeedForward::is_int8()
+// defensive pattern.
+TEST(FastConformerEncoder, PosEmbCacheInvalidatesOnDTypeChange) {
+    parakeet::models::EncoderConfig cfg;
+    cfg.num_layers = 1;
+    parakeet::models::FastConformerEncoder enc(cfg);
+
+    (void)enc.pos_emb(10, 64, DType::Float32, Device::CPU);
+    (void)enc.pos_emb(20, 64, DType::Float32, Device::CPU);
+    EXPECT_EQ(enc.pos_emb_cache_size(), 2u);
+
+    enc.to(DType::Float16);
+    EXPECT_EQ(enc.pos_emb_cache_size(), 0u);
+}
+
+TEST(FastConformerEncoder, PosEmbCacheInvalidatesOnLoadStateDict) {
+    parakeet::models::EncoderConfig cfg;
+    cfg.num_layers = 1;
+    parakeet::models::FastConformerEncoder enc(cfg);
+
+    (void)enc.pos_emb(10, 64, DType::Float32, Device::CPU);
+    EXPECT_EQ(enc.pos_emb_cache_size(), 1u);
+
+    // Empty state dict with strict=false suffices to take the
+    // load_state_dict path without needing real weights.
+    std::map<std::string, Tensor> empty_sd;
+    enc.load_state_dict(empty_sd, "", /*strict=*/false);
+    EXPECT_EQ(enc.pos_emb_cache_size(), 0u);
 }
 
 // E2E confirmation that real forward() calls flow through the cache. Skips

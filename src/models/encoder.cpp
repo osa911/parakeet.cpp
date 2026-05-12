@@ -348,6 +348,10 @@ void FastConformerEncoder::load_state_dict(
     const std::map<std::string, Tensor> &state_dict,
     const std::string &prefix, bool strict) {
 
+    // Reloading weights can change dtype/device of subsequent forwards;
+    // cache entries from the previous configuration would never hit again.
+    pos_emb_cache_.clear();
+
     // Always load fp16 weights first via the base Module logic.
     Module::load_state_dict(state_dict, prefix, strict);
 
@@ -438,6 +442,20 @@ Tensor FastConformerEncoder::pos_emb(int seq_len, int d_model, DType dtype,
     return it->second;
 }
 
+// Migrating to a different device makes every cached tensor unusable
+// (wrong device) — clear before delegating so the base recursion can
+// migrate the rest of the encoder.
+Module &FastConformerEncoder::to(Device device) {
+    pos_emb_cache_.clear();
+    return Module::to(device);
+}
+
+// Same story for dtype casts.
+Module &FastConformerEncoder::to(DType dtype) {
+    pos_emb_cache_.clear();
+    return Module::to(dtype);
+}
+
 Tensor FastConformerEncoder::forward(const Tensor &input,
                                      const Tensor &mask) const {
     // Top-level encoder phase signposts. Inner ConformerBlock::forward
@@ -461,17 +479,17 @@ Tensor FastConformerEncoder::forward(const Tensor &input,
 
     int seq_len = static_cast<int>(x.shape()[1]);
     int d_model = static_cast<int>(x.shape()[2]);
-    Tensor pos_emb;
+    Tensor pos_emb_tensor;
     {
         PARAKEET_SP_BEGIN(PosEmb);
-        pos_emb = this->pos_emb(seq_len, d_model, x.dtype(), x.device());
+        pos_emb_tensor = pos_emb(seq_len, d_model, x.dtype(), x.device());
         PARAKEET_SP_END(PosEmb);
     }
 
     {
         PARAKEET_SP_BEGIN(ConformerBlocks);
         for (const auto &block : layers_.each<ConformerBlock>()) {
-            x = block(x, pos_emb, mask);
+            x = block(x, pos_emb_tensor, mask);
         }
         PARAKEET_SP_END(ConformerBlocks);
     }
