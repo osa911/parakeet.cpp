@@ -426,6 +426,13 @@ Tensor FastConformerEncoder::forward(const Tensor &input,
     // Top-level encoder phase signposts. Inner ConformerBlock::forward
     // emits FFN1/Attn/Conv/FFN2/BlockFinalNorm signposts; those nest
     // inside ConformerBlocks so Instruments shows the hierarchy.
+    //
+    // Attribution caveat: only the outer Encoder interval is GPU-
+    // inclusive (the call returns after the final GPU sync that
+    // materializes the output tensor). Inner intervals measure CPU-
+    // side wall around command-buffer encoding ops; the actual GPU
+    // execution happens asynchronously between blocks. Pair with the
+    // Metal System Trace instrument for true GPU-side attribution.
     PARAKEET_SP_BEGIN(Encoder);
 
     Tensor x;

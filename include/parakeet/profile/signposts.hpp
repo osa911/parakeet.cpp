@@ -25,6 +25,13 @@
 // (used as a token-pasted variable name). Use UpperCamelCase joined
 // (`FFN1`, `ConformerBlocks`, `BlockFinalNorm`), not space-separated.
 //
+// Bracing requirement: ALWAYS wrap each begin/end pair in `{ }`. The
+// macros emit local declarations (token-pasted log + id variables)
+// that the end macro reads back; they cannot be `do { } while(0)`-
+// wrapped. Two `PARAKEET_SP_BEGIN(SameName)` calls in the same scope
+// fail to compile (variable redeclaration) — intentional, forces
+// each interval to live in its own brace block.
+//
 
 #if defined(__APPLE__)
 #include <os/log.h>
