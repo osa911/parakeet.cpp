@@ -421,6 +421,23 @@ void FastConformerEncoder::load_int8_weights_(
     }
 }
 
+// WAS-28 PR #3 — sinusoidal_position_embedding consumed ~22.5% of encoder
+// wall on every forward but is pure-function on (seq_len, d_model, dtype,
+// device). Cache hits return in <<1 ms and let multi-chunk transcribes pay
+// the compute once. Single-threaded by contract: a parakeet engine
+// serialises transcribe calls per instance, so no mutex.
+Tensor FastConformerEncoder::pos_emb(int seq_len, int d_model, DType dtype,
+                                     Device device) const {
+    PosEmbKey key{seq_len, d_model, dtype, device};
+    auto it = pos_emb_cache_.find(key);
+    if (it == pos_emb_cache_.end()) {
+        Tensor pe = axiom::nn::sinusoidal_position_embedding(
+            seq_len, d_model, dtype, device);
+        it = pos_emb_cache_.emplace(key, std::move(pe)).first;
+    }
+    return it->second;
+}
+
 Tensor FastConformerEncoder::forward(const Tensor &input,
                                      const Tensor &mask) const {
     // Top-level encoder phase signposts. Inner ConformerBlock::forward
@@ -447,8 +464,7 @@ Tensor FastConformerEncoder::forward(const Tensor &input,
     Tensor pos_emb;
     {
         PARAKEET_SP_BEGIN(PosEmb);
-        pos_emb = axiom::nn::sinusoidal_position_embedding(
-            seq_len, d_model, x.dtype(), x.device());
+        pos_emb = this->pos_emb(seq_len, d_model, x.dtype(), x.device());
         PARAKEET_SP_END(PosEmb);
     }
 
