@@ -467,6 +467,18 @@ void FastConformerEncoder::load_int8_weights_(
         const std::string f1p = lp + "ffn1_.";
         const std::string f2p = lp + "ffn2_.";
 
+        // Per-layer mixed-precision fallback. The quantizer's --exclude-layers
+        // flag produces safetensors where some conformer blocks intentionally
+        // lack int8 keys (their fp16 weights, loaded above via
+        // Module::load_state_dict, are the production path). Sentinel-key
+        // probe: if q_proj_quantized is absent, treat the whole block as
+        // fp16-only and skip the int8 setter. Partial-missing (some keys
+        // present, others not) is a quantizer bug — the get() chain below
+        // still throws on that case.
+        if (state_dict.find(ap + "q_proj_quantized") == state_dict.end()) {
+            continue;
+        }
+
         auto &block = static_cast<ConformerBlock &>(layers_[static_cast<size_t>(i)]);
         block.load_int8_weights(
             // attention q/k/v/out_proj

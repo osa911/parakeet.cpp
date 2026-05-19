@@ -22,6 +22,7 @@ Usage:
 """
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -43,9 +44,37 @@ QUANTIZABLE_PATTERNS = (
     ".ffn2_.fc2_.weight",   # FFN contract
 )
 
+# Layer-index extractor for `--exclude-layers`. Matches the conformer block
+# index from key names like `encoder_.layers_.23.attn_.mha_.q_proj.weight`.
+_LAYER_IDX_RE = re.compile(r"layers_\.(\d+)\.")
+
 
 def is_quantizable(name: str) -> bool:
     return any(p in name for p in QUANTIZABLE_PATTERNS)
+
+
+def layer_index(name: str):
+    """Return the conformer-block index encoded in `name`, or None if absent.
+
+    Non-block tensors (subsampling conv stack, the encoder-final norm) have
+    no `layers_.N.` segment and return None — they're not eligible for
+    `--exclude-layers` filtering either way.
+    """
+    m = _LAYER_IDX_RE.search(name)
+    return int(m.group(1)) if m else None
+
+
+def parse_exclude_layers(spec: str) -> set:
+    """Parse a comma-separated list of layer indices (e.g. \"23\" or \"22,23\")."""
+    if not spec:
+        return set()
+    out = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        out.add(int(part))
+    return out
 
 
 def quantize_block_sym(W: np.ndarray, block_size: int = 32):
@@ -74,6 +103,25 @@ def main():
     ap.add_argument("--out", dest="out_path", required=True, type=Path)
     ap.add_argument("--block-size", type=int, default=32)
     ap.add_argument(
+        "--exclude-layers",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated conformer-block indices whose matmul weights "
+            "should be passed through as fp16/fp32 instead of quantized to "
+            "int8. Use to preserve full precision on layers whose output "
+            "feeds the TDT joiner directly (typically the final encoder "
+            "block; investigation pending: trailing-token hallucinations on "
+            "v3-int8 encoder were not present on the same-architecture ONNX "
+            "int8 path, suggesting block-32 sym quantization noise in the "
+            "joiner-feeding layer amplifies blank-vs-token decisions). "
+            "Example: --exclude-layers 23  (parakeet-tdt-0.6b-v3 has 24 "
+            "blocks indexed 0-23). Requires the parakeet.cpp encoder loader "
+            "(FastConformerEncoder::load_int8_weights_) to tolerate "
+            "per-block fp16 fallback — see commit landing this flag."
+        ),
+    )
+    ap.add_argument(
         "--strict",
         action="store_true",
         help=(
@@ -87,6 +135,7 @@ def main():
         ),
     )
     args = ap.parse_args()
+    excluded_layers = parse_exclude_layers(args.exclude_layers)
 
     out_tensors = {}
     quant_count = 0
@@ -94,12 +143,19 @@ def main():
     total_bytes_in = 0
     total_bytes_out = 0
 
+    excluded_count = 0
     with safe_open(args.in_path, framework="numpy") as f:
         for name in f.keys():
             t = f.get_tensor(name)
             total_bytes_in += t.nbytes
 
-            if is_quantizable(name) and t.ndim == 2 and t.shape[1] % args.block_size == 0:
+            layer_idx = layer_index(name)
+            excluded = layer_idx is not None and layer_idx in excluded_layers
+
+            if (is_quantizable(name)
+                    and not excluded
+                    and t.ndim == 2
+                    and t.shape[1] % args.block_size == 0):
                 t_fp32 = t.astype(np.float32)
                 W_int8, scales_fp16 = quantize_block_sym(t_fp32, args.block_size)
                 base = name[:-len(".weight")]  # strip ".weight"
@@ -113,10 +169,18 @@ def main():
             else:
                 out_tensors[name] = t
                 total_bytes_out += t.nbytes
-                passthrough_count += 1
+                if excluded and is_quantizable(name):
+                    excluded_count += 1
+                    print(f"  -  {name}  {t.shape}  fp16 pass-through "
+                          f"(layer {layer_idx} excluded)")
+                else:
+                    passthrough_count += 1
 
     print(f"\nQuantized: {quant_count} matmul weights")
-    print(f"Pass-through: {passthrough_count} other tensors")
+    if excluded_count:
+        print(f"Excluded (passed through as fp16): {excluded_count} matmul "
+              f"weights from layers {sorted(excluded_layers)}")
+    print(f"Pass-through (non-matmul): {passthrough_count} other tensors")
     if total_bytes_in > 0:
         print(f"Total: {total_bytes_in / 1e6:.0f} MB -> {total_bytes_out / 1e6:.0f} MB "
               f"({100 * (1 - total_bytes_out / total_bytes_in):.0f}% reduction)")
