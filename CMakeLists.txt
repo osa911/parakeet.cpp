@@ -40,6 +40,7 @@ add_library(parakeet_lib
     src/audio/audio_io.cpp
     src/audio/vad.cpp
     src/models/encoder.cpp
+    src/models/fastconformer_block_program.cpp
     src/models/streaming_encoder.cpp
     src/models/lstm.cpp
     src/models/transformer.cpp
@@ -71,6 +72,7 @@ target_include_directories(parakeet_lib
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/axiom/src
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/dr_libs
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb
 )
@@ -189,7 +191,61 @@ if(PARAKEET_BUILD_TESTS)
     # WAS-27 L2 integration parity test: nn::Linear int8 dequant+MPSMM vs lazy path
     add_executable(test_linear_int8_mpsmm_parity tests/test_linear_int8_mpsmm_parity.cpp)
     target_link_libraries(test_linear_int8_mpsmm_parity PRIVATE parakeet_lib GTest::gtest GTest::gtest_main)
+    target_include_directories(test_linear_int8_mpsmm_parity PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/axiom/src
+    )
     add_test(NAME test_linear_int8_mpsmm_parity COMMAND test_linear_int8_mpsmm_parity
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+
+    add_executable(test_int8_ffn_execution tests/test_int8_ffn_execution.cpp)
+    target_link_libraries(test_int8_ffn_execution PRIVATE parakeet_lib GTest::gtest GTest::gtest_main)
+    target_include_directories(test_int8_ffn_execution PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/axiom/src
+    )
+    add_test(NAME test_int8_ffn_execution COMMAND test_int8_ffn_execution
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+
+    add_executable(test_fastconformer_pointwise_glu
+        tests/test_fastconformer_pointwise_glu.cpp)
+    target_link_libraries(test_fastconformer_pointwise_glu PRIVATE
+        parakeet_lib GTest::gtest GTest::gtest_main)
+    add_test(NAME test_fastconformer_pointwise_glu
+        COMMAND test_fastconformer_pointwise_glu
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+
+    add_executable(test_hybrid_metal_graph
+        tests/test_hybrid_metal_graph.cpp)
+    target_link_libraries(test_hybrid_metal_graph PRIVATE
+        parakeet_lib GTest::gtest GTest::gtest_main)
+    target_include_directories(test_hybrid_metal_graph PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/axiom/src
+    )
+    add_test(NAME test_hybrid_metal_graph
+        COMMAND test_hybrid_metal_graph
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+
+    add_executable(test_fastconformer_block_program
+        tests/test_fastconformer_block_program.cpp)
+    target_link_libraries(test_fastconformer_block_program PRIVATE
+        parakeet_lib GTest::gtest GTest::gtest_main)
+    target_include_directories(test_fastconformer_block_program PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/axiom/src
+    )
+    add_test(NAME FastConformerBlockProgram
+        COMMAND test_fastconformer_block_program
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+
+    add_executable(test_position_projection_cache_capacity
+        tests/test_position_projection_cache_capacity.cpp)
+    target_link_libraries(test_position_projection_cache_capacity PRIVATE
+        parakeet_lib GTest::gtest GTest::gtest_main)
+    add_test(NAME PositionProjectionCacheCapacity
+        COMMAND test_position_projection_cache_capacity
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     )
 endif()

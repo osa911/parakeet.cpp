@@ -11,8 +11,10 @@ Output safetensors layout per matmul weight named "<X>.weight":
   <X>_quantized   INT8    [N, K]
   <X>_scale       FLOAT16 [N, K // 32]
 
-Other tensors (LayerNorm gains, biases, conv weights, etc.) are
-copied through unchanged.
+LayerNorm gains, biases, depthwise-convolution weights, and the subsampling
+stack are copied through unchanged. The two ungrouped 1x1 convolution weights
+in each Conformer block are flattened to [N, K] and use the same blockwise
+INT8 representation as Linear.
 
 Usage:
   python3 scripts/quantize_int8.py \\
@@ -31,7 +33,9 @@ from safetensors import safe_open
 
 
 # Weight-tensor name patterns to quantize. Encoder-only matmul weights.
-# LayerNorm + biases + conv subsampling stack stay fp32/fp16.
+# LayerNorm + biases + depthwise convolutions + conv subsampling stack stay
+# fp32/fp16. Pointwise 1x1 convolutions are matrix multiplications in a
+# [B,C,T] layout and are quantized below after flattening their trailing 1.
 QUANTIZABLE_PATTERNS = (
     ".mha_.q_proj.weight",
     ".mha_.k_proj.weight",
@@ -43,9 +47,18 @@ QUANTIZABLE_PATTERNS = (
     ".ffn2_.fc2_.weight",   # FFN contract
 )
 
+POINTWISE_CONV_PATTERNS = (
+    ".conv_.pointwise_conv1_.weight",
+    ".conv_.pointwise_conv2_.weight",
+)
+
 
 def is_quantizable(name: str) -> bool:
     return any(p in name for p in QUANTIZABLE_PATTERNS)
+
+
+def is_pointwise_conv(name: str) -> bool:
+    return any(p in name for p in POINTWISE_CONV_PATTERNS)
 
 
 def quantize_block_sym(W: np.ndarray, block_size: int = 32):
@@ -99,15 +112,23 @@ def main():
             t = f.get_tensor(name)
             total_bytes_in += t.nbytes
 
-            if is_quantizable(name) and t.ndim == 2 and t.shape[1] % args.block_size == 0:
+            pointwise = is_pointwise_conv(name)
+            quantizable = (
+                is_quantizable(name) and t.ndim == 2
+            ) or (
+                pointwise and t.ndim == 3 and t.shape[2] == 1
+            )
+            if quantizable and t.shape[1] % args.block_size == 0:
                 t_fp32 = t.astype(np.float32)
+                if pointwise:
+                    t_fp32 = t_fp32[:, :, 0]
                 W_int8, scales_fp16 = quantize_block_sym(t_fp32, args.block_size)
                 base = name[:-len(".weight")]  # strip ".weight"
                 out_tensors[f"{base}_quantized"] = W_int8
                 out_tensors[f"{base}_scale"] = scales_fp16
                 total_bytes_out += W_int8.nbytes + scales_fp16.nbytes
                 quant_count += 1
-                print(f"  Q  {name}  {t.shape}  fp32 -> int8  "
+                print(f"  Q  {name}  {t.shape} -> {W_int8.shape} fp32 -> int8  "
                       f"({W_int8.nbytes / 1e6:.1f}MB+"
                       f"{scales_fp16.nbytes / 1e6:.1f}MB scales)")
             else:

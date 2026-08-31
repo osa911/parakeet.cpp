@@ -1,10 +1,12 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <axiom/axiom.hpp>
 #include <axiom/nn.hpp>
@@ -15,6 +17,16 @@ namespace parakeet::models {
 
 using namespace axiom;
 using namespace axiom::nn;
+
+class FastConformerBlockProgram;
+
+namespace detail {
+
+// Parses the bounded projected-position cache policy. Kept separate from the
+// cache itself so its default and environment override remain regression-testable.
+size_t position_projection_cache_capacity();
+
+} // namespace detail
 
 // ─── Feed-Forward Module (Macaron-style half-step) ──────────────────────────
 
@@ -55,6 +67,8 @@ class FeedForward : public Module {
     bool all_int8_on(Device d) const;
 
   private:
+    friend class FastConformerBlockProgram;
+
     LayerNorm norm_;
     Linear fc1_;
     Linear fc2_;
@@ -70,7 +84,17 @@ class ConformerConvModule : public Module {
     Tensor forward(const Tensor &input) const;
     Tensor operator()(const Tensor &input) const { return forward(input); }
 
+    // Optional extension of the encoder INT8 artifact: the two ungrouped 1x1
+    // convolutions are stored as [N,K] blockwise INT8 matrices and dispatched
+    // through Conv1d's layout-preserving pointwise route.
+    void load_int8_pointwise_weights(Tensor pointwise1_int8,
+                                     Tensor pointwise1_scale,
+                                     Tensor pointwise2_int8,
+                                     Tensor pointwise2_scale);
+
   private:
+    friend class FastConformerBlockProgram;
+
     LayerNorm norm_;
     Conv1d pointwise_conv1_; // hidden_size → 2*hidden_size (for GLU)
     Conv1d depthwise_conv_;  // groups=hidden_size, kernel_size=9
@@ -99,6 +123,9 @@ class ConformerAttention : public Module {
                            Tensor k_scale, Tensor v_int8, Tensor v_scale,
                            Tensor o_int8, Tensor o_scale);
 
+    // Optional experimental path for relative-position projection weights.
+    void load_int8_position_projection_weights(Tensor weights, Tensor scale);
+
     // Derived from primary state: true iff mha_'s q_proj weight is Int8 and
     // its scale_ parameter is loaded. No separate bool field — same rationale
     // as FeedForward::is_int8().
@@ -116,7 +143,16 @@ class ConformerAttention : public Module {
     // resident on `d`. See FeedForward::all_int8_on() for full rationale.
     bool all_int8_on(Device d) const;
 
+    // The projected relative-position tensor is derived only from immutable
+    // model state and a padded position embedding. Clear it before a weight,
+    // device, or dtype transition.
+    void clear_position_projection_cache();
+    Module &to(Device device) override;
+    Module &to(DType dtype) override;
+
   private:
+    friend class FastConformerBlockProgram;
+
     LayerNorm norm_;
     MultiHeadAttention mha_;
     Linear pos_proj_;
@@ -128,7 +164,26 @@ class ConformerAttention : public Module {
     Tensor rel_position_attention(const Tensor &query, const Tensor &key,
                                   const Tensor &value, const Tensor &pos_emb,
                                   const Tensor &mask) const;
+    Tensor projected_position(const Tensor &pos_emb, size_t num_heads,
+                              bool head_major) const;
     static Tensor rel_shift(const Tensor &x);
+
+    // A bounded LRU keeps the relative-position projection warm across the
+    // small set of active exact encoder shapes without retaining an unbounded
+    // sum of long-audio tensors. The capacity is controlled by
+    // PARAKEET_POSITION_PROJECTION_CACHE_ENTRIES and defaults to nine, which
+    // keeps a strict upper bound on long-audio retention.
+    struct PositionProjectionCacheEntry {
+        Shape input_shape;
+        DType dtype = DType::Float32;
+        Device device = Device::CPU;
+        bool head_major = false;
+        Tensor projected;
+        uint64_t last_used = 0;
+    };
+    mutable std::vector<PositionProjectionCacheEntry>
+        position_projection_cache_;
+    mutable uint64_t position_projection_cache_clock_ = 0;
 };
 
 // ─── Conformer Block ────────────────────────────────────────────────────────
@@ -161,7 +216,18 @@ class ConformerBlock : public Module {
         Tensor ffn2_fc1_int8, Tensor ffn2_fc1_scale,
         Tensor ffn2_fc2_int8, Tensor ffn2_fc2_scale);
 
+    void load_int8_pointwise_conv_weights(Tensor pointwise1_int8,
+                                           Tensor pointwise1_scale,
+                                           Tensor pointwise2_int8,
+                                           Tensor pointwise2_scale);
+
+    void load_int8_position_projection_weights(Tensor weights, Tensor scale);
+
+    void clear_position_projection_cache();
+
   private:
+    friend class FastConformerBlockProgram;
+
     FeedForward ffn1_;
     ConformerAttention attn_;
     ConformerConvModule conv_;
@@ -202,6 +268,16 @@ class ConvSubsampling : public Module {
 
 class FastConformerEncoder : public Module {
   public:
+    struct F16PointwiseRouteStats {
+        size_t projection_calls = 0;
+        size_t glu_calls = 0;
+        size_t direct_glu_calls = 0;
+        size_t direct_glu_comparison_calls = 0;
+        float direct_glu_max_abs_error = 0.0f;
+        float direct_glu_default_exp_max_abs_error = 0.0f;
+        float direct_glu_rounded_sigmoid_max_abs_error = 0.0f;
+    };
+
     explicit FastConformerEncoder(const EncoderConfig &config = {});
 
     Tensor forward(const Tensor &input, const Tensor &mask = Tensor()) const;
@@ -242,12 +318,25 @@ class FastConformerEncoder : public Module {
     // consumers do not depend on entry-level details.
     size_t pos_emb_cache_size() const { return pos_emb_cache_.size(); }
 
+    // Snapshot of the last successfully completed forward. The three routes
+    // are mutually exclusive per convolution block: `projection_calls`
+    // means a direct FP16 projection followed by generic GLU, `glu_calls`
+    // means the fused direct FP16 pointwise+GLU kernel ran, and
+    // `direct_glu_calls` means the established MPSGraph pointwise projection
+    // was followed by the channels-first direct FP16 GLU. The two following
+    // fields are populated only by the test-only real-activation comparison.
+    // This snapshot is diagnostic-only and does not influence route selection.
+    F16PointwiseRouteStats f16_pointwise_route_stats() const {
+        return last_f16_pointwise_route_stats_;
+    }
+
   private:
     EncoderConfig config_;
     ConvSubsampling subsampling_;
     ModuleList layers_;
 
     bool is_int8_ = false;
+    mutable F16PointwiseRouteStats last_f16_pointwise_route_stats_;
 
     // Cache key for memoised sinusoidal_position_embedding results.
     // (d_model, dtype, device) are effectively constant once the encoder is

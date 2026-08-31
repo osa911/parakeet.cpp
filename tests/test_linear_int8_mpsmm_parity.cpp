@@ -7,7 +7,10 @@
 #include <axiom/system.hpp>
 #include <axiom/tensor.hpp>
 
+#include "backends/metal/metal_common.hpp"
+
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <map>
 #include <string>
@@ -39,6 +42,15 @@ struct ScopedLazyEnv {
         else    unsetenv("AXIOM_FORCE_LAZY_LINEAR");
     }
     ~ScopedLazyEnv() { unsetenv("AXIOM_FORCE_LAZY_LINEAR"); }
+};
+
+struct ScopedLegacyGemmCoalescingEnv {
+    ScopedLegacyGemmCoalescingEnv() {
+        setenv("AXIOM_LEGACY_INT8_GEMM_COALESCING", "1", 1);
+    }
+    ~ScopedLegacyGemmCoalescingEnv() {
+        unsetenv("AXIOM_LEGACY_INT8_GEMM_COALESCING");
+    }
 };
 
 // Block-symmetric int8 quantization, block=32 along K dim (Phase 1 scheme).
@@ -197,5 +209,47 @@ INSTANTIATE_TEST_SUITE_P(
     [](const ::testing::TestParamInfo<LinearParityParams> &info) {
         return info.param.shape_name;
     });
+
+class LegacyDirectGemmCoalescingTest : public ::testing::Test {
+  protected:
+    void SetUp() override {
+        if (!axiom::system::should_run_gpu_tests()) {
+            GTEST_SKIP() << "Requires Metal GPU";
+        }
+    }
+};
+
+// The legacy fused route owns both GEMMs and has no intervening MPSGraph or
+// MPSMatrixMultiplication operation. It must retain one Metal compute encoder
+// across the pair. MPSGraph still closes any open encoder through
+// MetalExecutionStream::current_mps_buffer().
+TEST_F(LegacyDirectGemmCoalescingTest,
+       LegacyChainedGemmsShareOneMetalComputeEncoder) {
+    auto input = Tensor::randn({256, 1024}, DType::Float32, Device::CPU)
+                     .astype(DType::Float16)
+                     .to(Device::GPU);
+    const auto first_weight = Tensor::randn(
+        {1024, 1024}, DType::Float32, Device::CPU);
+    const auto second_weight = Tensor::randn(
+        {512, 1024}, DType::Float32, Device::CPU);
+    const auto first = quantize_block_symmetric_k32(first_weight);
+    const auto second = quantize_block_symmetric_k32(second_weight);
+
+    auto &stream = axiom::backends::metal::MetalExecutionStream::instance();
+    stream.synchronize();
+    const uint64_t encoders_before = stream.compute_encoder_creation_count();
+
+    ScopedLazyEnv guard(true);
+    ScopedLegacyGemmCoalescingEnv coalescing_guard;
+    const Tensor intermediate = axiom::ops::int8_matmul(
+        input, first.weight_int8, first.scale_fp16);
+    const Tensor output = axiom::ops::int8_matmul(
+        intermediate, second.weight_int8, second.scale_fp16);
+
+    EXPECT_EQ(output.shape(), (Shape{256, 512}));
+    EXPECT_EQ(stream.compute_encoder_creation_count(), encoders_before + 1)
+        << "two adjacent legacy GEMMs must share their Metal compute encoder";
+    stream.synchronize();
+}
 
 } // namespace
