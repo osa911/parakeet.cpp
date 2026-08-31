@@ -7,9 +7,11 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdint>
+#include <initializer_list>
 #include <map>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "parakeet/models/encoder.hpp"
 
@@ -156,7 +158,9 @@ AttentionInputs make_inputs() {
 }
 
 void expect_direct_route_parity(const std::optional<std::string> &head_layout) {
-    ASSERT_TRUE(axiom::system::should_run_gpu_tests());
+    if (!axiom::system::should_run_gpu_tests()) {
+        GTEST_SKIP() << "Requires Metal GPU";
+    }
     ConformerAttention attention(kNumHeads, /*dropout=*/0.0f);
     configure_attention(attention);
     auto inputs = make_inputs();
@@ -176,12 +180,135 @@ void expect_direct_route_parity(const std::optional<std::string> &head_layout) {
     }
 }
 
+std::map<std::string, Tensor> make_encoder_state() {
+    constexpr size_t kSubsamplingChannels = 8;
+    constexpr size_t kFfnIntermediate = 64;
+    constexpr size_t kKernelSize = 9;
+
+    auto zeros = [](std::initializer_list<size_t> shape) {
+        return Tensor::zeros(axiom::Shape(std::vector<size_t>(shape)),
+                             DType::Float32);
+    };
+    auto ones = [](size_t size) { return Tensor::ones({size}, DType::Float32); };
+    std::map<std::string, Tensor> state;
+
+    state["subsampling_.conv1_.weight"] =
+        zeros({kSubsamplingChannels, 1, 3, 3});
+    state["subsampling_.conv1_.bias"] = zeros({kSubsamplingChannels});
+    state["subsampling_.dw1_.weight"] =
+        zeros({kSubsamplingChannels, 1, 3, 3});
+    state["subsampling_.dw1_.bias"] = zeros({kSubsamplingChannels});
+    state["subsampling_.conv2_.weight"] =
+        zeros({kSubsamplingChannels, kSubsamplingChannels, 1, 1});
+    state["subsampling_.conv2_.bias"] = zeros({kSubsamplingChannels});
+    state["subsampling_.dw2_.weight"] =
+        zeros({kSubsamplingChannels, 1, 3, 3});
+    state["subsampling_.dw2_.bias"] = zeros({kSubsamplingChannels});
+    state["subsampling_.conv3_.weight"] =
+        zeros({kSubsamplingChannels, kSubsamplingChannels, 1, 1});
+    state["subsampling_.conv3_.bias"] = zeros({kSubsamplingChannels});
+    state["subsampling_.proj_.weight"] = zeros({kHidden, kSubsamplingChannels});
+    state["subsampling_.proj_.bias"] = zeros({kHidden});
+
+    const std::string layer = "layers_.0.";
+    state[layer + "ffn1_.norm_.weight"] = ones(kHidden);
+    state[layer + "ffn1_.norm_.bias"] = zeros({kHidden});
+    state[layer + "ffn1_.fc1_.weight"] = zeros({kFfnIntermediate, kHidden});
+    state[layer + "ffn1_.fc2_.weight"] = zeros({kHidden, kFfnIntermediate});
+
+    state[layer + "attn_.norm_.weight"] = ones(kHidden);
+    state[layer + "attn_.norm_.bias"] = zeros({kHidden});
+    state[layer + "attn_.mha_.q_proj.weight"] = zeros({kHidden, kHidden});
+    state[layer + "attn_.mha_.k_proj.weight"] = zeros({kHidden, kHidden});
+    state[layer + "attn_.mha_.v_proj.weight"] = zeros({kHidden, kHidden});
+    state[layer + "attn_.mha_.out_proj.weight"] = zeros({kHidden, kHidden});
+    state[layer + "attn_.pos_proj_.weight"] = zeros({kHidden, kHidden});
+    state[layer + "attn_.pos_bias_u_"] = zeros({kNumHeads, kHidden / kNumHeads});
+    state[layer + "attn_.pos_bias_v_"] = zeros({kNumHeads, kHidden / kNumHeads});
+
+    state[layer + "conv_.norm_.weight"] = ones(kHidden);
+    state[layer + "conv_.norm_.bias"] = zeros({kHidden});
+    state[layer + "conv_.pointwise_conv1_.weight"] =
+        zeros({2 * kHidden, kHidden, 1});
+    state[layer + "conv_.pointwise_conv1_.bias"] = zeros({2 * kHidden});
+    state[layer + "conv_.depthwise_conv_.weight"] =
+        zeros({kHidden, 1, kKernelSize});
+    state[layer + "conv_.depthwise_conv_.bias"] = zeros({kHidden});
+    state[layer + "conv_.batch_norm_.weight"] = ones(kHidden);
+    state[layer + "conv_.batch_norm_.bias"] = zeros({kHidden});
+    state[layer + "conv_.batch_norm_.running_mean"] = zeros({kHidden});
+    state[layer + "conv_.batch_norm_.running_var"] = ones(kHidden);
+    state[layer + "conv_.batch_norm_.num_batches_tracked"] = zeros({1});
+    state[layer + "conv_.pointwise_conv2_.weight"] = zeros({kHidden, kHidden, 1});
+    state[layer + "conv_.pointwise_conv2_.bias"] = zeros({kHidden});
+
+    state[layer + "ffn2_.norm_.weight"] = ones(kHidden);
+    state[layer + "ffn2_.norm_.bias"] = zeros({kHidden});
+    state[layer + "ffn2_.fc1_.weight"] = zeros({kFfnIntermediate, kHidden});
+    state[layer + "ffn2_.fc2_.weight"] = zeros({kHidden, kFfnIntermediate});
+    state[layer + "final_norm_.weight"] = ones(kHidden);
+    state[layer + "final_norm_.bias"] = zeros({kHidden});
+
+    auto int8_weight = [](size_t rows, size_t columns) {
+        return Tensor::zeros({rows, columns}, DType::Int8);
+    };
+    auto int8_scale = [](size_t rows, size_t columns) {
+        return Tensor::ones({rows, columns / 32}, DType::Float16);
+    };
+    const auto add_quantized = [&](const std::string &name, size_t rows,
+                                   size_t columns) {
+        state[layer + name + "_quantized"] = int8_weight(rows, columns);
+        state[layer + name + "_scale"] = int8_scale(rows, columns);
+    };
+    add_quantized("attn_.mha_.q_proj", kHidden, kHidden);
+    add_quantized("attn_.mha_.k_proj", kHidden, kHidden);
+    add_quantized("attn_.mha_.v_proj", kHidden, kHidden);
+    add_quantized("attn_.mha_.out_proj", kHidden, kHidden);
+    add_quantized("ffn1_.fc1_", kFfnIntermediate, kHidden);
+    add_quantized("ffn1_.fc2_", kHidden, kFfnIntermediate);
+    add_quantized("ffn2_.fc1_", kFfnIntermediate, kHidden);
+    add_quantized("ffn2_.fc2_", kHidden, kFfnIntermediate);
+    return state;
+}
+
 TEST(DirectInt8QkvRoute, PublishesEncoderRouteStatsContract) {
     parakeet::models::FastConformerEncoder encoder;
     const parakeet::models::EncoderRouteStats stats = encoder.route_stats();
     EXPECT_EQ(stats.direct_int8_qkv, 0U);
     EXPECT_EQ(stats.direct_int8_qkv_rejected, 0U);
     EXPECT_EQ(stats.direct_int8_qkv_head_layout, 0U);
+}
+
+TEST(DirectInt8QkvRoute, CompletedEncoderForwardRecordsDefaultDirectRoute) {
+    if (!axiom::system::should_run_gpu_tests()) {
+        GTEST_SKIP() << "Requires Metal GPU";
+    }
+
+    parakeet::models::EncoderConfig config;
+    config.mel_bins = 8;
+    config.subsampling_channels = 8;
+    config.hidden_size = static_cast<int>(kHidden);
+    config.num_layers = 1;
+    config.num_heads = kNumHeads;
+    config.ffn_intermediate = 64;
+    config.dropout = 0.0f;
+    parakeet::models::FastConformerEncoder encoder(config);
+    encoder.load_state_dict(make_encoder_state(), "", /*strict=*/false);
+    encoder.to(DType::Float16);
+    encoder.to(Device::GPU);
+
+    ScopedEnvironmentVariable direct_qkv("PARAKEET_DIRECT_INT8_QKV",
+                                          std::nullopt);
+    ScopedEnvironmentVariable direct_head_layout(
+        "PARAKEET_DIRECT_INT8_QKV_HEAD_LAYOUT", std::nullopt);
+    const Tensor output = encoder.forward(
+        Tensor::zeros({1, 8, 8}, DType::Float16, Device::GPU));
+    (void)output.to(Device::CPU);
+
+    const parakeet::models::EncoderRouteStats stats = encoder.route_stats();
+    EXPECT_EQ(stats.direct_int8_qkv, 1U);
+    EXPECT_EQ(stats.direct_int8_qkv_head_layout, 1U);
+    EXPECT_EQ(stats.direct_int8_qkv_rejected, 0U);
 }
 
 TEST(DirectInt8QkvRoute, ForcedGenericMatchesSyntheticAttention) {

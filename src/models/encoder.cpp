@@ -74,8 +74,11 @@ bool can_use_direct_int8_qkv(const Tensor &query, const Tensor &key,
         return false;
     }
 
+    const size_t batch_size = query.shape()[0];
+    const size_t sequence_length = query.shape()[1];
     const size_t input_dim = query.shape()[2];
-    if (input_dim == 0 || input_dim % 32 != 0 ||
+    if (batch_size == 0 || sequence_length == 0 || input_dim == 0 ||
+        input_dim % 32 != 0 ||
         q_proj.weight().shape().size() != 2) {
         return false;
     }
