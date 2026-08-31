@@ -192,6 +192,12 @@ if(PARAKEET_BUILD_TESTS)
     add_test(NAME test_linear_int8_mpsmm_parity COMMAND test_linear_int8_mpsmm_parity
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     )
+
+    add_executable(test_direct_int8_qkv tests/test_direct_int8_qkv.cpp)
+    target_link_libraries(test_direct_int8_qkv PRIVATE parakeet_lib GTest::gtest GTest::gtest_main)
+    add_test(NAME test_direct_int8_qkv COMMAND test_direct_int8_qkv
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
 endif()
 
 # ── Examples ─────────────────────────────────────────────────────────────────

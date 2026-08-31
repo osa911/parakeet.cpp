@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <functional>
 #include <map>
@@ -15,6 +16,12 @@ namespace parakeet::models {
 
 using namespace axiom;
 using namespace axiom::nn;
+
+struct EncoderRouteStats {
+    uint64_t direct_int8_qkv = 0;
+    uint64_t direct_int8_qkv_rejected = 0;
+    uint64_t direct_int8_qkv_head_layout = 0;
+};
 
 // ─── Feed-Forward Module (Macaron-style half-step) ──────────────────────────
 
@@ -242,6 +249,8 @@ class FastConformerEncoder : public Module {
     // consumers do not depend on entry-level details.
     size_t pos_emb_cache_size() const { return pos_emb_cache_.size(); }
 
+    EncoderRouteStats route_stats() const;
+
   private:
     EncoderConfig config_;
     ConvSubsampling subsampling_;
@@ -285,10 +294,15 @@ class FastConformerEncoder : public Module {
     mutable std::unordered_map<PosEmbKey, Tensor, PosEmbKeyHash>
         pos_emb_cache_;
 
+    mutable std::atomic<uint64_t> direct_int8_qkv_{0};
+    mutable std::atomic<uint64_t> direct_int8_qkv_rejected_{0};
+    mutable std::atomic<uint64_t> direct_int8_qkv_head_layout_{0};
+
     // Scans state_dict for _quantized keys and injects int8 weight pairs
     // into each ConformerBlock's sub-modules.
     void load_int8_weights_(const std::map<std::string, Tensor> &state_dict,
                             const std::string &prefix);
+    void record_route_stats_(const EncoderRouteStats &stats) const;
 };
 
 } // namespace parakeet::models

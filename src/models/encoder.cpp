@@ -1,7 +1,9 @@
 #include "parakeet/models/encoder.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <string>
+#include <string_view>
 
 #include <axiom/error.hpp>
 #include <axiom/nn/positional.hpp>
@@ -9,6 +11,86 @@
 #include "parakeet/profile/signposts.hpp"
 
 namespace parakeet::models {
+
+namespace {
+
+thread_local EncoderRouteStats forward_route_stats;
+
+class ForwardRouteStatsScope {
+  public:
+    ForwardRouteStatsScope() : previous_(forward_route_stats) {
+        forward_route_stats = {};
+    }
+
+    ~ForwardRouteStatsScope() { forward_route_stats = previous_; }
+
+    EncoderRouteStats completed_stats() const { return forward_route_stats; }
+
+  private:
+    EncoderRouteStats previous_;
+};
+
+bool direct_int8_qkv_enabled() {
+    const char *value = std::getenv("PARAKEET_DIRECT_INT8_QKV");
+    return value == nullptr || std::string_view(value) == "1";
+}
+
+bool direct_int8_qkv_head_layout_enabled() {
+    const char *value = std::getenv("PARAKEET_DIRECT_INT8_QKV_HEAD_LAYOUT");
+    return direct_int8_qkv_enabled() &&
+           (value == nullptr || std::string_view(value) == "1");
+}
+
+bool has_compatible_int8_projection(const Linear &projection, size_t input_dim,
+                                    size_t output_dim) {
+    const Tensor &weight = projection.weight();
+    const Tensor &scale = projection.scale();
+    if (!projection.has_scale() || weight.dtype() != DType::Int8 ||
+        scale.dtype() != DType::Float16 || weight.device() != Device::GPU ||
+        scale.device() != Device::GPU || weight.shape().size() != 2 ||
+        scale.shape().size() != 2 || weight.shape()[0] != output_dim ||
+        weight.shape()[1] != input_dim || scale.shape()[0] != output_dim ||
+        scale.shape()[1] != input_dim / 32) {
+        return false;
+    }
+
+    if (projection.has_bias() && projection.bias().storage()) {
+        const Tensor &bias = projection.bias();
+        return bias.dtype() == DType::Float16 && bias.device() == Device::GPU &&
+               bias.shape() == Shape{output_dim};
+    }
+    return true;
+}
+
+bool can_use_direct_int8_qkv(const Tensor &query, const Tensor &key,
+                             const Tensor &value, const Linear &q_proj,
+                             const Linear &k_proj, const Linear &v_proj,
+                             int num_heads) {
+    if (num_heads <= 0 || query.shape().size() != 3 ||
+        query.shape() != key.shape() || query.shape() != value.shape() ||
+        query.storage() != key.storage() || query.storage() != value.storage() ||
+        query.dtype() != DType::Float16 || query.device() != Device::GPU ||
+        !query.is_contiguous()) {
+        return false;
+    }
+
+    const size_t input_dim = query.shape()[2];
+    if (input_dim == 0 || input_dim % 32 != 0 ||
+        q_proj.weight().shape().size() != 2) {
+        return false;
+    }
+    const size_t output_dim = q_proj.weight().shape()[0];
+    return output_dim > 0 && output_dim % static_cast<size_t>(num_heads) == 0 &&
+           has_compatible_int8_projection(q_proj, input_dim, output_dim) &&
+           has_compatible_int8_projection(k_proj, input_dim, output_dim) &&
+           has_compatible_int8_projection(v_proj, input_dim, output_dim);
+}
+
+Tensor projection_bias(const Linear &projection) {
+    return projection.has_bias() ? projection.bias() : Tensor();
+}
+
+} // namespace
 
 // ─── FeedForward ────────────────────────────────────────────────────────────
 
@@ -169,41 +251,76 @@ Tensor ConformerAttention::rel_position_attention(const Tensor &query,
     // Metal System Trace for true GPU-side attribution.
 
     int num_heads = mha_.num_heads();
+    const bool direct_qkv = direct_int8_qkv_enabled();
+    const bool direct_head_layout = direct_int8_qkv_head_layout_enabled();
+    const auto &q_proj = mha_.q_proj();
+    const auto &k_proj = mha_.k_proj();
+    const auto &v_proj = mha_.v_proj();
 
-    // Project Q, K, V — Linear::forward() dispatches to int8_matmul
-    // automatically when weight is Int8 + scale is loaded (WAS-27 fast path).
-    // Bias is applied inside Linear::forward(), no explicit add needed here.
     Tensor q, k, v;
-    {
-        PARAKEET_SP_BEGIN(QProj);
-        q = mha_.q_proj()(query);
-        PARAKEET_SP_END(QProj);
-    }
-    {
-        PARAKEET_SP_BEGIN(KProj);
-        k = mha_.k_proj()(key);
-        PARAKEET_SP_END(KProj);
-    }
-    {
-        PARAKEET_SP_BEGIN(VProj);
-        v = mha_.v_proj()(value);
-        PARAKEET_SP_END(VProj);
+    const bool use_direct_qkv =
+        direct_qkv && can_use_direct_int8_qkv(query, key, value, q_proj, k_proj,
+                                               v_proj, num_heads);
+    if (use_direct_qkv) {
+        PARAKEET_SP_BEGIN(QKVProj);
+        if (direct_head_layout) {
+            auto projections = ops::int8_qkv_matmul_bias_head_layout(
+                query, q_proj.weight(), q_proj.scale(), projection_bias(q_proj),
+                k_proj.weight(), k_proj.scale(), projection_bias(k_proj),
+                v_proj.weight(), v_proj.scale(), projection_bias(v_proj),
+                static_cast<size_t>(num_heads));
+            q = std::move(projections[0]);
+            k = std::move(projections[1]);
+            v = std::move(projections[2]);
+            ++forward_route_stats.direct_int8_qkv_head_layout;
+        } else {
+            auto projections = ops::int8_qkv_matmul_bias(
+                query, q_proj.weight(), q_proj.scale(), projection_bias(q_proj),
+                k_proj.weight(), k_proj.scale(), projection_bias(k_proj),
+                v_proj.weight(), v_proj.scale(), projection_bias(v_proj));
+            q = std::move(projections[0]);
+            k = std::move(projections[1]);
+            v = std::move(projections[2]);
+        }
+        ++forward_route_stats.direct_int8_qkv;
+        PARAKEET_SP_END(QKVProj);
+    } else {
+        if (direct_qkv) {
+            ++forward_route_stats.direct_int8_qkv_rejected;
+        }
+        {
+            PARAKEET_SP_BEGIN(QProj);
+            q = q_proj(query);
+            PARAKEET_SP_END(QProj);
+        }
+        {
+            PARAKEET_SP_BEGIN(KProj);
+            k = k_proj(key);
+            PARAKEET_SP_END(KProj);
+        }
+        {
+            PARAKEET_SP_BEGIN(VProj);
+            v = v_proj(value);
+            PARAKEET_SP_END(VProj);
+        }
     }
 
-    auto d_model = static_cast<int>(q.shape().back());
+    auto d_model = static_cast<int>(q_proj.weight().shape()[0]);
     int head_dim = d_model / num_heads;
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
-    auto batch = q.shape()[0];
-    auto seq_len = q.shape()[1];
+    auto batch = query.shape()[0];
+    auto seq_len = query.shape()[1];
 
     // Reshape to multi-head: (batch, seq, heads, head_dim) → (batch, heads,
     // seq, head_dim)
     auto nh = static_cast<size_t>(num_heads);
     auto hd = static_cast<size_t>(head_dim);
-    q = q.reshape({batch, seq_len, nh, hd}).transpose({0, 2, 1, 3});
-    k = k.reshape({batch, seq_len, nh, hd}).transpose({0, 2, 1, 3});
-    v = v.reshape({batch, seq_len, nh, hd}).transpose({0, 2, 1, 3});
+    if (!use_direct_qkv || !direct_head_layout) {
+        q = q.reshape({batch, seq_len, nh, hd}).transpose({0, 2, 1, 3});
+        k = k.reshape({batch, seq_len, nh, hd}).transpose({0, 2, 1, 3});
+        v = v.reshape({batch, seq_len, nh, hd}).transpose({0, 2, 1, 3});
+    }
 
     // q: (batch, heads, seq, head_dim)
     // pos_bias_u/v: (heads, head_dim) → broadcast as (1, heads, 1, head_dim)
@@ -527,6 +644,7 @@ Tensor FastConformerEncoder::forward(const Tensor &input,
     // side wall around command-buffer encoding ops; the actual GPU
     // execution happens asynchronously between blocks. Pair with the
     // Metal System Trace instrument for true GPU-side attribution.
+    ForwardRouteStatsScope route_stats_scope;
     PARAKEET_SP_BEGIN(Encoder);
 
     Tensor x;
@@ -554,7 +672,26 @@ Tensor FastConformerEncoder::forward(const Tensor &input,
     }
 
     PARAKEET_SP_END(Encoder);
+    record_route_stats_(route_stats_scope.completed_stats());
     return x;
+}
+
+EncoderRouteStats FastConformerEncoder::route_stats() const {
+    return {
+        direct_int8_qkv_.load(std::memory_order_relaxed),
+        direct_int8_qkv_rejected_.load(std::memory_order_relaxed),
+        direct_int8_qkv_head_layout_.load(std::memory_order_relaxed),
+    };
+}
+
+void FastConformerEncoder::record_route_stats_(
+    const EncoderRouteStats &stats) const {
+    direct_int8_qkv_.fetch_add(stats.direct_int8_qkv,
+                               std::memory_order_relaxed);
+    direct_int8_qkv_rejected_.fetch_add(stats.direct_int8_qkv_rejected,
+                                        std::memory_order_relaxed);
+    direct_int8_qkv_head_layout_.fetch_add(stats.direct_int8_qkv_head_layout,
+                                           std::memory_order_relaxed);
 }
 
 } // namespace parakeet::models
