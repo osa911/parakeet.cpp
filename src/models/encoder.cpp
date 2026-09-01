@@ -1,7 +1,9 @@
 #include "parakeet/models/encoder.hpp"
 
 #include <cmath>
+#include <memory>
 #include <string>
+#include <utility>
 
 #include <axiom/error.hpp>
 #include <axiom/nn/positional.hpp>
@@ -9,6 +11,129 @@
 #include "parakeet/profile/signposts.hpp"
 
 namespace parakeet::models {
+
+namespace {
+
+thread_local EncoderRouteStats *active_route_stats = nullptr;
+
+class ForwardRouteStatsScope {
+  public:
+    ForwardRouteStatsScope() : previous_(active_route_stats) {
+        active_route_stats = &stats_;
+    }
+
+    ~ForwardRouteStatsScope() { active_route_stats = previous_; }
+
+    const EncoderRouteStats &stats() const { return stats_; }
+
+  private:
+    EncoderRouteStats stats_;
+    EncoderRouteStats *previous_;
+};
+
+void mark_direct_qkv_head_layout() {
+    if (active_route_stats != nullptr) {
+        active_route_stats->direct_qkv_head_layout_used = true;
+    }
+}
+
+void mark_direct_silu() {
+    if (active_route_stats != nullptr) {
+        active_route_stats->direct_silu_used = true;
+    }
+}
+
+void mark_cached_position_head_layout() {
+    if (active_route_stats != nullptr) {
+        active_route_stats->cached_position_head_layout_used = true;
+    }
+}
+
+void mark_bounded_workspace() {
+    if (active_route_stats != nullptr) {
+        active_route_stats->bounded_workspace_used = true;
+    }
+}
+
+bool has_compatible_int8_projection(const Linear &projection, size_t hidden) {
+    if (!projection.has_scale()) {
+        return false;
+    }
+    const Tensor &weight = projection.weight();
+    const Tensor &scale = projection.scale();
+    if (weight.device() != Device::GPU || weight.dtype() != DType::Int8 ||
+        !weight.is_contiguous() || weight.shape() != Shape{hidden, hidden} ||
+        scale.device() != Device::GPU || scale.dtype() != DType::Float16 ||
+        !scale.is_contiguous() || scale.shape() != Shape{hidden, hidden / 32}) {
+        return false;
+    }
+    if (!projection.has_bias() || !projection.bias().storage()) {
+        return true;
+    }
+    const Tensor &bias = projection.bias();
+    return bias.device() == Device::GPU && bias.dtype() == DType::Float16 &&
+           bias.is_contiguous() && bias.shape() == Shape{hidden};
+}
+
+bool can_use_direct_qkv_head_layout(const Tensor &query, const Tensor &key,
+                                    const Tensor &value,
+                                    const Linear &q_projection,
+                                    const Linear &k_projection,
+                                    const Linear &v_projection,
+                                    size_t num_heads) {
+    if (query.device() != Device::GPU || query.dtype() != DType::Float16 ||
+        query.ndim() != 3 || !query.is_contiguous() ||
+        query.shape() != key.shape() || query.shape() != value.shape() ||
+        !query.shares_storage(key) || !query.shares_storage(value) ||
+        query.shape()[0] == 0 || query.shape()[1] == 0 ||
+        query.shape()[2] == 0) {
+        return false;
+    }
+    const size_t hidden = query.shape()[2];
+    return hidden % 32 == 0 && num_heads > 0 && hidden % num_heads == 0 &&
+           has_compatible_int8_projection(q_projection, hidden) &&
+           has_compatible_int8_projection(k_projection, hidden) &&
+           has_compatible_int8_projection(v_projection, hidden);
+}
+
+Tensor projection_bias(const Linear &projection) {
+    return projection.has_bias() ? projection.bias() : Tensor();
+}
+
+bool can_use_direct_silu(const Tensor &activation,
+                         const Linear &source_projection) {
+    if (!source_projection.has_scale()) {
+        return false;
+    }
+    const Tensor &weight = source_projection.weight();
+    const Tensor &scale = source_projection.scale();
+    return activation.device() == Device::GPU &&
+           activation.dtype() == DType::Float16 && activation.ndim() == 3 &&
+           activation.shape()[0] > 0 && activation.shape()[1] > 0 &&
+           activation.shape()[2] > 0 && activation.is_contiguous() &&
+           weight.device() == Device::GPU && weight.dtype() == DType::Int8 &&
+           weight.ndim() == 2 && weight.is_contiguous() &&
+           scale.device() == Device::GPU && scale.dtype() == DType::Float16 &&
+           scale.ndim() == 2 && scale.is_contiguous() &&
+           activation.shape()[2] == weight.shape()[0] &&
+           weight.shape()[1] > 0 && weight.shape()[1] % 32 == 0 &&
+           scale.shape() == Shape{weight.shape()[0], weight.shape()[1] / 32};
+}
+
+bool can_cache_position_head_layout(const Tensor &pos_emb,
+                                    const Linear &projection, size_t num_heads,
+                                    size_t hidden) {
+    const Tensor &weight = projection.weight();
+    return num_heads > 0 && hidden > 0 && hidden % num_heads == 0 &&
+           pos_emb.device() == Device::GPU &&
+           pos_emb.dtype() == DType::Float16 && pos_emb.ndim() == 2 &&
+           pos_emb.shape()[0] > 0 && pos_emb.shape()[1] == hidden &&
+           pos_emb.is_contiguous() && weight.device() == Device::GPU &&
+           weight.dtype() == DType::Float16 && weight.ndim() == 2 &&
+           weight.is_contiguous() && weight.shape() == Shape{hidden, hidden};
+}
+
+} // namespace
 
 // ─── FeedForward ────────────────────────────────────────────────────────────
 
@@ -44,7 +169,12 @@ bool FeedForward::all_int8_on(Device d) const {
 Tensor FeedForward::forward(const Tensor &input) const {
     auto x = norm_(input);
     x = fc1_(x);
-    x = ops::silu(x);
+    if (can_use_direct_silu(x, fc1_)) {
+        ops::int8_silu_inplace(x);
+        mark_direct_silu();
+    } else {
+        x = ops::silu(x);
+    }
     x = dropout_(x);
     x = fc2_(x);
     return input + x * 0.5f; // macaron half-step
@@ -121,6 +251,55 @@ bool ConformerAttention::all_int8_on(Device d) const {
            on(mha_.out_proj().weight()) && on(mha_.out_proj().scale());
 }
 
+void ConformerAttention::clear_position_projection_cache() {
+    position_projection_source_ = Tensor();
+    position_projection_head_layout_ = Tensor();
+    position_projection_num_heads_ = 0;
+}
+
+Module &ConformerAttention::to(Device device) {
+    clear_position_projection_cache();
+    return Module::to(device);
+}
+
+Module &ConformerAttention::to(DType dtype) {
+    clear_position_projection_cache();
+    return Module::to(dtype);
+}
+
+Tensor
+ConformerAttention::projected_position_head_layout(const Tensor &pos_emb,
+                                                   size_t num_heads) const {
+    const bool cache_hit =
+        position_projection_source_.storage() &&
+        position_projection_head_layout_.storage() &&
+        position_projection_num_heads_ == num_heads &&
+        position_projection_source_.shape() == pos_emb.shape() &&
+        position_projection_source_.strides() == pos_emb.strides() &&
+        position_projection_source_.offset() == pos_emb.offset() &&
+        position_projection_source_.dtype() == pos_emb.dtype() &&
+        position_projection_source_.device() == pos_emb.device() &&
+        position_projection_source_.shares_storage(pos_emb);
+    if (cache_hit) {
+        mark_cached_position_head_layout();
+        return position_projection_head_layout_;
+    }
+
+    ScopedGpuWorkspaceAllocationBypass persistent_allocation;
+    Tensor projected = pos_proj_(pos_emb);
+    const size_t pos_len = projected.shape()[0];
+    const size_t hidden = projected.shape()[1];
+    projected = projected.reshape({1, pos_len, num_heads, hidden / num_heads})
+                    .transpose({0, 2, 1, 3})
+                    .ascontiguousarray();
+    static_cast<void>(projected.storage());
+    position_projection_source_ = pos_emb;
+    position_projection_head_layout_ = std::move(projected);
+    position_projection_num_heads_ = num_heads;
+    mark_cached_position_head_layout();
+    return position_projection_head_layout_;
+}
+
 Tensor ConformerAttention::rel_shift(const Tensor &x) {
     // x: (batch, heads, seq_len, 2*seq_len-1)
     // Returns: (batch, heads, seq_len, seq_len)
@@ -170,40 +349,62 @@ Tensor ConformerAttention::rel_position_attention(const Tensor &query,
 
     int num_heads = mha_.num_heads();
 
-    // Project Q, K, V — Linear::forward() dispatches to int8_matmul
-    // automatically when weight is Int8 + scale is loaded (WAS-27 fast path).
-    // Bias is applied inside Linear::forward(), no explicit add needed here.
+    const auto &q_projection = mha_.q_proj();
+    const auto &k_projection = mha_.k_proj();
+    const auto &v_projection = mha_.v_proj();
+    const size_t num_heads_size = static_cast<size_t>(num_heads);
+    const bool direct_qkv_head_layout = can_use_direct_qkv_head_layout(
+        query, key, value, q_projection, k_projection, v_projection,
+        num_heads_size);
+
     Tensor q, k, v;
-    {
-        PARAKEET_SP_BEGIN(QProj);
-        q = mha_.q_proj()(query);
-        PARAKEET_SP_END(QProj);
-    }
-    {
-        PARAKEET_SP_BEGIN(KProj);
-        k = mha_.k_proj()(key);
-        PARAKEET_SP_END(KProj);
-    }
-    {
-        PARAKEET_SP_BEGIN(VProj);
-        v = mha_.v_proj()(value);
-        PARAKEET_SP_END(VProj);
+    if (direct_qkv_head_layout) {
+        PARAKEET_SP_BEGIN(QKVProj);
+        auto projections = ops::int8_qkv_matmul_bias_head_layout(
+            query, q_projection.weight(), q_projection.scale(),
+            projection_bias(q_projection), k_projection.weight(),
+            k_projection.scale(), projection_bias(k_projection),
+            v_projection.weight(), v_projection.scale(),
+            projection_bias(v_projection), num_heads_size);
+        q = std::move(projections[0]);
+        k = std::move(projections[1]);
+        v = std::move(projections[2]);
+        mark_direct_qkv_head_layout();
+        PARAKEET_SP_END(QKVProj);
+    } else {
+        {
+            PARAKEET_SP_BEGIN(QProj);
+            q = q_projection(query);
+            PARAKEET_SP_END(QProj);
+        }
+        {
+            PARAKEET_SP_BEGIN(KProj);
+            k = k_projection(key);
+            PARAKEET_SP_END(KProj);
+        }
+        {
+            PARAKEET_SP_BEGIN(VProj);
+            v = v_projection(value);
+            PARAKEET_SP_END(VProj);
+        }
     }
 
-    auto d_model = static_cast<int>(q.shape().back());
+    auto d_model = static_cast<int>(query.shape().back());
     int head_dim = d_model / num_heads;
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
-    auto batch = q.shape()[0];
-    auto seq_len = q.shape()[1];
+    const auto batch = query.shape()[0];
+    const auto seq_len = query.shape()[1];
 
     // Reshape to multi-head: (batch, seq, heads, head_dim) → (batch, heads,
     // seq, head_dim)
     auto nh = static_cast<size_t>(num_heads);
     auto hd = static_cast<size_t>(head_dim);
-    q = q.reshape({batch, seq_len, nh, hd}).transpose({0, 2, 1, 3});
-    k = k.reshape({batch, seq_len, nh, hd}).transpose({0, 2, 1, 3});
-    v = v.reshape({batch, seq_len, nh, hd}).transpose({0, 2, 1, 3});
+    if (!direct_qkv_head_layout) {
+        q = q.reshape({batch, seq_len, nh, hd}).transpose({0, 2, 1, 3});
+        k = k.reshape({batch, seq_len, nh, hd}).transpose({0, 2, 1, 3});
+        v = v.reshape({batch, seq_len, nh, hd}).transpose({0, 2, 1, 3});
+    }
 
     // q: (batch, heads, seq, head_dim)
     // pos_bias_u/v: (heads, head_dim) → broadcast as (1, heads, 1, head_dim)
@@ -220,14 +421,25 @@ Tensor ConformerAttention::rel_position_attention(const Tensor &query,
 
     // Position attention: project position embeddings
     Tensor p;
+    const bool position_head_layout =
+        direct_qkv_head_layout &&
+        can_cache_position_head_layout(pos_emb, pos_proj_, nh,
+                                       static_cast<size_t>(d_model));
     {
         PARAKEET_SP_BEGIN(PosProj);
-        p = pos_proj_(pos_emb); // (2*seq-1, d_model)
+        if (position_head_layout) {
+            p = projected_position_head_layout(pos_emb, nh);
+        } else {
+            p = pos_proj_(pos_emb); // (2*seq-1, d_model)
+        }
         PARAKEET_SP_END(PosProj);
     }
-    auto pos_len = p.shape()[0];
-    // Reshape to (1, 2*seq-1, heads, head_dim) → (1, heads, 2*seq-1, head_dim)
-    p = p.reshape({1, pos_len, nh, hd}).transpose({0, 2, 1, 3});
+    if (!position_head_layout) {
+        auto pos_len = p.shape()[0];
+        // Reshape to (1, 2*seq-1, heads, head_dim) →
+        // (1, heads, 2*seq-1, head_dim)
+        p = p.reshape({1, pos_len, nh, hd}).transpose({0, 2, 1, 3});
+    }
 
     // (Q + pos_bias_v) @ P^T → (batch, heads, seq, 2*seq-1)
     Tensor pos_score;
@@ -321,6 +533,10 @@ void ConformerBlock::load_int8_weights(
         std::move(ffn2_fc2_int8), std::move(ffn2_fc2_scale));
 }
 
+void ConformerBlock::clear_position_projection_cache() {
+    attn_.clear_position_projection_cache();
+}
+
 Tensor ConformerBlock::forward(const Tensor &input, const Tensor &pos_emb,
                                const Tensor &mask) const {
     // Signposts: Instruments aggregates by literal name → across 18 blocks,
@@ -395,8 +611,10 @@ Tensor ConvSubsampling::forward(const Tensor &input) const {
 
 // ─── FastConformerEncoder ───────────────────────────────────────────────────
 
-FastConformerEncoder::FastConformerEncoder(const EncoderConfig &config)
-    : config_(config), subsampling_(config.subsampling_channels) {
+FastConformerEncoder::FastConformerEncoder(const EncoderConfig &config,
+                                           EncoderExecutionConfig execution)
+    : config_(config), execution_(execution),
+      subsampling_(config.subsampling_channels) {
     for (int i = 0; i < config.num_layers; ++i) {
         layers_.emplace_back<ConformerBlock>(config);
     }
@@ -410,6 +628,9 @@ void FastConformerEncoder::load_state_dict(
     // Reloading weights can change dtype/device of subsequent forwards;
     // cache entries from the previous configuration would never hit again.
     pos_emb_cache_.clear();
+    for (auto &block : layers_.each<ConformerBlock>()) {
+        block.clear_position_projection_cache();
+    }
 
     // Always load fp16 weights first via the base Module logic.
     Module::load_state_dict(state_dict, prefix, strict);
@@ -494,6 +715,7 @@ Tensor FastConformerEncoder::pos_emb(int seq_len, int d_model, DType dtype,
     PosEmbKey key{seq_len, d_model, dtype, device};
     auto it = pos_emb_cache_.find(key);
     if (it == pos_emb_cache_.end()) {
+        ScopedGpuWorkspaceAllocationBypass persistent_allocation;
         Tensor pe = axiom::nn::sinusoidal_position_embedding(
             seq_len, d_model, dtype, device);
         it = pos_emb_cache_.emplace(key, std::move(pe)).first;
@@ -527,6 +749,17 @@ Tensor FastConformerEncoder::forward(const Tensor &input,
     // side wall around command-buffer encoding ops; the actual GPU
     // execution happens asynchronously between blocks. Pair with the
     // Metal System Trace instrument for true GPU-side attribution.
+    ForwardRouteStatsScope route_stats_scope;
+
+    std::unique_ptr<ScopedMetalWorkspace> workspace;
+    if (execution_.workspace_mode == EncoderWorkspaceMode::Boost) {
+        WorkspaceOptions options;
+        options.retained_limit_bytes = size_t{512} * 1024 * 1024;
+        options.storage_mode = WorkspaceStorageMode::Private;
+        workspace = std::make_unique<ScopedMetalWorkspace>(options);
+        mark_bounded_workspace();
+    }
+
     PARAKEET_SP_BEGIN(Encoder);
 
     Tensor x;
@@ -554,7 +787,23 @@ Tensor FastConformerEncoder::forward(const Tensor &input,
     }
 
     PARAKEET_SP_END(Encoder);
-    return x;
+
+    Tensor output;
+    if (workspace) {
+        // The returned tensor outlives this request. Copy it onto ordinary
+        // storage before releasing the last request-owned workspace lease.
+        {
+            ScopedGpuWorkspaceAllocationBypass persistent_allocation;
+            output = x.copy();
+        }
+        x = Tensor();
+        workspace->close();
+    } else {
+        output = std::move(x);
+    }
+
+    last_route_stats_ = route_stats_scope.stats();
+    return output;
 }
 
 } // namespace parakeet::models

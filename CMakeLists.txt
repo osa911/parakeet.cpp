@@ -192,6 +192,19 @@ if(PARAKEET_BUILD_TESTS)
     add_test(NAME test_linear_int8_mpsmm_parity COMMAND test_linear_int8_mpsmm_parity
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     )
+
+    # Safe Direct model-level regression. The production INT8 checkpoint is
+    # intentionally external; an empty or unavailable path makes only the
+    # runtime test skip while this target still proves the public API compiles.
+    set(PARAKEET_SAFE_DIRECT_MODEL_FIXTURE "" CACHE FILEPATH
+        "Path to the production INT8 FastConformer safetensors fixture")
+    add_executable(test_safe_direct_encoder tests/test_safe_direct_encoder.cpp)
+    target_link_libraries(test_safe_direct_encoder PRIVATE parakeet_lib GTest::gtest GTest::gtest_main)
+    target_compile_definitions(test_safe_direct_encoder PRIVATE
+        PARAKEET_SAFE_DIRECT_MODEL_FIXTURE="${PARAKEET_SAFE_DIRECT_MODEL_FIXTURE}")
+    add_test(NAME test_safe_direct_encoder COMMAND test_safe_direct_encoder
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
 endif()
 
 # ── Examples ─────────────────────────────────────────────────────────────────

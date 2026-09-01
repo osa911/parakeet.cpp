@@ -19,6 +19,12 @@ struct EncoderConfig {
     float layer_norm_eps = 1e-5f;
 };
 
+enum class EncoderWorkspaceMode { LowerMemory, Boost };
+
+struct EncoderExecutionConfig {
+    EncoderWorkspaceMode workspace_mode = EncoderWorkspaceMode::LowerMemory;
+};
+
 // ─── Subsampling Activation ─────────────────────────────────────────────────
 
 enum class SubsamplingActivation { SiLU, ReLU };

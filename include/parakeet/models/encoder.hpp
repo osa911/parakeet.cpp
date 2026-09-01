@@ -16,6 +16,17 @@ namespace parakeet::models {
 using namespace axiom;
 using namespace axiom::nn;
 
+// Diagnostic snapshot of the routes taken by the last completed encoder
+// forward. These observations never participate in route selection.
+struct EncoderRouteStats {
+    bool direct_qkv_head_layout_used = false;
+    bool direct_silu_used = false;
+    bool cached_position_head_layout_used = false;
+    bool bounded_workspace_used = false;
+    bool direct_residual_used = false;
+    bool fused_pointwise_glu_used = false;
+};
+
 // ─── Feed-Forward Module (Macaron-style half-step) ──────────────────────────
 
 class FeedForward : public Module {
@@ -116,6 +127,10 @@ class ConformerAttention : public Module {
     // resident on `d`. See FeedForward::all_int8_on() for full rationale.
     bool all_int8_on(Device d) const;
 
+    void clear_position_projection_cache();
+    Module &to(Device device) override;
+    Module &to(DType dtype) override;
+
   private:
     LayerNorm norm_;
     MultiHeadAttention mha_;
@@ -128,7 +143,16 @@ class ConformerAttention : public Module {
     Tensor rel_position_attention(const Tensor &query, const Tensor &key,
                                   const Tensor &value, const Tensor &pos_emb,
                                   const Tensor &mask) const;
+    Tensor projected_position_head_layout(const Tensor &pos_emb,
+                                          size_t num_heads) const;
     static Tensor rel_shift(const Tensor &x);
+
+    // One immutable projection per attention layer is retained. Replacing the
+    // entry on a shape change keeps LowerMemory bounded while still making the
+    // normal padded-input path a cache hit on subsequent forwards.
+    mutable Tensor position_projection_source_;
+    mutable Tensor position_projection_head_layout_;
+    mutable size_t position_projection_num_heads_ = 0;
 };
 
 // ─── Conformer Block ────────────────────────────────────────────────────────
@@ -160,6 +184,8 @@ class ConformerBlock : public Module {
         // FFN2: fc1, fc2
         Tensor ffn2_fc1_int8, Tensor ffn2_fc1_scale,
         Tensor ffn2_fc2_int8, Tensor ffn2_fc2_scale);
+
+    void clear_position_projection_cache();
 
   private:
     FeedForward ffn1_;
@@ -202,7 +228,8 @@ class ConvSubsampling : public Module {
 
 class FastConformerEncoder : public Module {
   public:
-    explicit FastConformerEncoder(const EncoderConfig &config = {});
+    explicit FastConformerEncoder(const EncoderConfig &config = {},
+                                  EncoderExecutionConfig execution = {});
 
     Tensor forward(const Tensor &input, const Tensor &mask = Tensor()) const;
     Tensor operator()(const Tensor &input,
@@ -242,12 +269,16 @@ class FastConformerEncoder : public Module {
     // consumers do not depend on entry-level details.
     size_t pos_emb_cache_size() const { return pos_emb_cache_.size(); }
 
+    EncoderRouteStats route_stats() const { return last_route_stats_; }
+
   private:
     EncoderConfig config_;
+    EncoderExecutionConfig execution_;
     ConvSubsampling subsampling_;
     ModuleList layers_;
 
     bool is_int8_ = false;
+    mutable EncoderRouteStats last_route_stats_;
 
     // Cache key for memoised sinusoidal_position_embedding results.
     // (d_model, dtype, device) are effectively constant once the encoder is
