@@ -228,4 +228,43 @@ TEST(SafeDirectEncoder, ProductionInt8RoutesMatchGenericControl) {
            "server memory bound holds across HTTP worker threads";
 }
 
+TEST(SafeDirectEncoder, RetainsPositionHeadLayoutsAcrossActiveBuckets) {
+    unset_encoder_experiments();
+
+    const std::filesystem::path fixture(PARAKEET_SAFE_DIRECT_MODEL_FIXTURE);
+    if (fixture.empty() || !std::filesystem::is_regular_file(fixture)) {
+        GTEST_SKIP() << "Production INT8 FastConformer fixture unavailable: "
+                     << fixture;
+    }
+
+    ASSERT_TRUE(axiom::system::should_run_gpu_tests())
+        << "The configured production fixture test requires Metal";
+    const auto weights = axiom::io::safetensors::load(fixture.string());
+    const std::string prefix = encoder_prefix(weights);
+    const auto config = parakeet::models::make_tdt_600m_config().encoder;
+    FastConformerEncoder encoder(
+        config,
+        EncoderExecutionConfig{
+            .workspace_mode = EncoderWorkspaceMode::LowerMemory});
+    auto prepared = prepare_encoder_weights(weights, prefix, /*generic_control=*/false);
+    encoder.load_state_dict(prepared, prefix, /*strict=*/false);
+
+    const auto forward = [&](size_t frames) {
+        return encoder
+            .forward(
+                Tensor::zeros({1, frames, 128}, DType::Float16, Device::GPU))
+            .to(Device::CPU)
+            .astype(DType::Float32);
+    };
+
+    static_cast<void>(forward(960));
+    static_cast<void>(forward(1152));
+    static_cast<void>(forward(960));
+
+    EXPECT_TRUE(encoder.route_stats().cached_position_head_layout_used);
+    EXPECT_TRUE(encoder.route_stats().cached_position_head_layout_cache_hit)
+        << "returning to a previously seen padded bucket must reuse its "
+           "position head-layout projection";
+}
+
 } // namespace

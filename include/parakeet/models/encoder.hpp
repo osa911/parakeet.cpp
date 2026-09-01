@@ -5,6 +5,7 @@
 #include <map>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <axiom/axiom.hpp>
 #include <axiom/nn.hpp>
@@ -22,6 +23,7 @@ struct EncoderRouteStats {
     bool direct_qkv_head_layout_used = false;
     bool direct_silu_used = false;
     bool cached_position_head_layout_used = false;
+    bool cached_position_head_layout_cache_hit = false;
     bool bounded_workspace_used = false;
     bool process_wide_workspace_used = false;
     bool direct_residual_used = false;
@@ -148,12 +150,22 @@ class ConformerAttention : public Module {
                                           size_t num_heads) const;
     static Tensor rel_shift(const Tensor &x);
 
-    // One immutable projection per attention layer is retained. Replacing the
-    // entry on a shape change keeps LowerMemory bounded while still making the
-    // normal padded-input path a cache hit on subsequent forwards.
-    mutable Tensor position_projection_source_;
-    mutable Tensor position_projection_head_layout_;
-    mutable size_t position_projection_num_heads_ = 0;
+    struct PositionProjectionCacheEntry {
+        Tensor source;
+        Tensor head_layout;
+        size_t num_heads = 0;
+        size_t last_used = 0;
+    };
+
+    // Bounded input buckets rotate among a small number of persistent position
+    // embeddings. Keep their head-major projections so switching buckets does
+    // not recompute every attention-layer position projection. Source storage
+    // remains part of the key, so equal-shaped caller-provided embeddings are
+    // never conflated.
+    static constexpr size_t kPositionProjectionCacheCapacity = 9;
+    mutable std::vector<PositionProjectionCacheEntry>
+        position_projection_cache_;
+    mutable size_t position_projection_cache_clock_ = 0;
 };
 
 // ─── Conformer Block ────────────────────────────────────────────────────────

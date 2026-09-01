@@ -1,5 +1,6 @@
 #include "parakeet/models/encoder.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <memory>
 #include <string>
@@ -46,6 +47,12 @@ void mark_direct_silu() {
 void mark_cached_position_head_layout() {
     if (active_route_stats != nullptr) {
         active_route_stats->cached_position_head_layout_used = true;
+    }
+}
+
+void mark_cached_position_head_layout_cache_hit() {
+    if (active_route_stats != nullptr) {
+        active_route_stats->cached_position_head_layout_cache_hit = true;
     }
 }
 
@@ -258,9 +265,8 @@ bool ConformerAttention::all_int8_on(Device d) const {
 }
 
 void ConformerAttention::clear_position_projection_cache() {
-    position_projection_source_ = Tensor();
-    position_projection_head_layout_ = Tensor();
-    position_projection_num_heads_ = 0;
+    position_projection_cache_.clear();
+    position_projection_cache_clock_ = 0;
 }
 
 Module &ConformerAttention::to(Device device) {
@@ -276,19 +282,23 @@ Module &ConformerAttention::to(DType dtype) {
 Tensor
 ConformerAttention::projected_position_head_layout(const Tensor &pos_emb,
                                                    size_t num_heads) const {
-    const bool cache_hit =
-        position_projection_source_.storage() &&
-        position_projection_head_layout_.storage() &&
-        position_projection_num_heads_ == num_heads &&
-        position_projection_source_.shape() == pos_emb.shape() &&
-        position_projection_source_.strides() == pos_emb.strides() &&
-        position_projection_source_.offset() == pos_emb.offset() &&
-        position_projection_source_.dtype() == pos_emb.dtype() &&
-        position_projection_source_.device() == pos_emb.device() &&
-        position_projection_source_.shares_storage(pos_emb);
-    if (cache_hit) {
+    const auto cache_hit = std::find_if(
+        position_projection_cache_.begin(), position_projection_cache_.end(),
+        [&](PositionProjectionCacheEntry &entry) {
+            return entry.source.storage() && entry.head_layout.storage() &&
+                   entry.num_heads == num_heads &&
+                   entry.source.shape() == pos_emb.shape() &&
+                   entry.source.strides() == pos_emb.strides() &&
+                   entry.source.offset() == pos_emb.offset() &&
+                   entry.source.dtype() == pos_emb.dtype() &&
+                   entry.source.device() == pos_emb.device() &&
+                   entry.source.shares_storage(pos_emb);
+        });
+    if (cache_hit != position_projection_cache_.end()) {
+        cache_hit->last_used = ++position_projection_cache_clock_;
         mark_cached_position_head_layout();
-        return position_projection_head_layout_;
+        mark_cached_position_head_layout_cache_hit();
+        return cache_hit->head_layout;
     }
 
     ScopedGpuWorkspaceAllocationBypass persistent_allocation;
@@ -299,11 +309,24 @@ ConformerAttention::projected_position_head_layout(const Tensor &pos_emb,
                     .transpose({0, 2, 1, 3})
                     .ascontiguousarray();
     static_cast<void>(projected.storage());
-    position_projection_source_ = pos_emb;
-    position_projection_head_layout_ = std::move(projected);
-    position_projection_num_heads_ = num_heads;
+    PositionProjectionCacheEntry entry{
+        pos_emb, std::move(projected), num_heads,
+        ++position_projection_cache_clock_};
+    if (position_projection_cache_.size() >=
+        kPositionProjectionCacheCapacity) {
+        const auto eviction = std::min_element(
+            position_projection_cache_.begin(), position_projection_cache_.end(),
+            [](const PositionProjectionCacheEntry &left,
+               const PositionProjectionCacheEntry &right) {
+                return left.last_used < right.last_used;
+            });
+        *eviction = std::move(entry);
+        mark_cached_position_head_layout();
+        return eviction->head_layout;
+    }
+    position_projection_cache_.push_back(std::move(entry));
     mark_cached_position_head_layout();
-    return position_projection_head_layout_;
+    return position_projection_cache_.back().head_layout;
 }
 
 Tensor ConformerAttention::rel_shift(const Tensor &x) {
