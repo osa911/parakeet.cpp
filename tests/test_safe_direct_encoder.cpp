@@ -215,6 +215,7 @@ TEST(SafeDirectEncoder, ProductionInt8RoutesMatchGenericControl) {
     EXPECT_FALSE(lower_memory.route_stats().direct_residual_used);
     EXPECT_FALSE(lower_memory.route_stats().fused_pointwise_glu_used);
     EXPECT_FALSE(lower_memory.route_stats().bounded_workspace_used);
+    EXPECT_FALSE(lower_memory.route_stats().process_wide_workspace_used);
 
     EXPECT_TRUE(boost.route_stats().direct_qkv_head_layout_used);
     EXPECT_TRUE(boost.route_stats().direct_silu_used);
@@ -222,6 +223,9 @@ TEST(SafeDirectEncoder, ProductionInt8RoutesMatchGenericControl) {
     EXPECT_FALSE(boost.route_stats().direct_residual_used);
     EXPECT_FALSE(boost.route_stats().fused_pointwise_glu_used);
     EXPECT_TRUE(boost.route_stats().bounded_workspace_used);
+    EXPECT_TRUE(boost.route_stats().process_wide_workspace_used)
+        << "Boost must select the process-wide serialized workspace pool so the "
+           "server memory bound holds across HTTP worker threads";
 }
 
 } // namespace

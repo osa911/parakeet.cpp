@@ -23,6 +23,7 @@ struct EncoderRouteStats {
     bool direct_silu_used = false;
     bool cached_position_head_layout_used = false;
     bool bounded_workspace_used = false;
+    bool process_wide_workspace_used = false;
     bool direct_residual_used = false;
     bool fused_pointwise_glu_used = false;
 };

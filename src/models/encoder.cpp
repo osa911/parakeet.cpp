@@ -55,6 +55,12 @@ void mark_bounded_workspace() {
     }
 }
 
+void mark_process_wide_workspace() {
+    if (active_route_stats != nullptr) {
+        active_route_stats->process_wide_workspace_used = true;
+    }
+}
+
 bool has_compatible_int8_projection(const Linear &projection, size_t hidden) {
     if (!projection.has_scale()) {
         return false;
@@ -756,8 +762,10 @@ Tensor FastConformerEncoder::forward(const Tensor &input,
         WorkspaceOptions options;
         options.retained_limit_bytes = size_t{512} * 1024 * 1024;
         options.storage_mode = WorkspaceStorageMode::Private;
+        options.cache_scope = WorkspaceCacheScope::ProcessWideSerialized;
         workspace = std::make_unique<ScopedMetalWorkspace>(options);
         mark_bounded_workspace();
+        mark_process_wide_workspace();
     }
 
     PARAKEET_SP_BEGIN(Encoder);
