@@ -13,6 +13,26 @@
 
 namespace parakeet::models {
 
+namespace detail {
+
+bool shares_direct_qkv_input(const Tensor &query, const Tensor &key,
+                             const Tensor &value) {
+    // The fused Axiom kernel consumes one activation. Rel-position attention
+    // may use three inputs in general, so preserve the generic path unless
+    // every view describes identical activations.
+    const auto same_view_as_query = [&query](const Tensor &candidate) {
+        return query.shape() == candidate.shape() &&
+               query.strides() == candidate.strides() &&
+               query.offset() == candidate.offset() &&
+               query.dtype() == candidate.dtype() &&
+               query.device() == candidate.device() &&
+               query.shares_storage(candidate);
+    };
+    return same_view_as_query(key) && same_view_as_query(value);
+}
+
+} // namespace detail
+
 namespace {
 
 thread_local EncoderRouteStats *active_route_stats = nullptr;
@@ -62,15 +82,6 @@ Tensor projection_bias(const Linear &projection) {
 
 ops::Int8Projection int8_projection(const Linear &projection) {
     return {projection.weight(), projection.scale(), projection_bias(projection)};
-}
-
-bool shares_direct_qkv_input(const Tensor &query, const Tensor &key,
-                             const Tensor &value) {
-    // The fused Axiom kernel consumes one activation. Rel-position attention
-    // may use three inputs in general, so preserve the generic path unless
-    // all three views describe the same underlying activations.
-    return query.shape() == key.shape() && query.shape() == value.shape() &&
-           query.shares_storage(key) && query.shares_storage(value);
 }
 
 bool can_use_direct_silu(const Tensor &activation,
@@ -345,7 +356,7 @@ Tensor ConformerAttention::rel_position_attention(const Tensor &query,
         int8_projection(q_projection), int8_projection(k_projection),
         int8_projection(v_projection)};
     const bool direct_qkv_head_layout =
-        shares_direct_qkv_input(query, key, value) &&
+        detail::shares_direct_qkv_input(query, key, value) &&
         ops::int8_qkv_head_layout_eligibility(query, qkv_projections,
                                               num_heads_size) ==
             ops::Int8QkvHeadLayoutEligibility::Eligible;

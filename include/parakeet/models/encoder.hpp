@@ -26,6 +26,16 @@ struct EncoderRouteStats {
     bool cached_position_head_layout_cache_hit = false;
 };
 
+namespace detail {
+
+// Returns true only when every projected Q/K/V input is the same logical
+// tensor view. The fused Direct-QKV kernel reads one activation tensor, so a
+// shared allocation alone is not sufficient.
+bool shares_direct_qkv_input(const Tensor &query, const Tensor &key,
+                             const Tensor &value);
+
+} // namespace detail
+
 // ─── Feed-Forward Module (Macaron-style half-step) ──────────────────────────
 
 class FeedForward : public Module {

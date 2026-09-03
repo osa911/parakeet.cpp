@@ -27,8 +27,23 @@ option(PARAKEET_INSTALL "Generate install rules for parakeet" OFF)
 # ── Axiom ────────────────────────────────────────────────────────────────────
 set(AXIOM_BUILD_TESTS OFF)
 set(AXIOM_BUILD_EXAMPLES OFF)
-set(AXIOM_INSTALL ${PARAKEET_INSTALL} CACHE BOOL
-    "Generate Axiom install exports when parakeet.cpp is installed" FORCE)
+if(PARAKEET_INSTALL)
+    # A Parakeet package exports a public dependency on Axiom::axiom. Do not
+    # silently override an explicit request to omit Axiom's export; that would
+    # create an install tree that configures but cannot be consumed.
+    if(DEFINED CACHE{AXIOM_INSTALL} AND NOT AXIOM_INSTALL)
+        message(FATAL_ERROR
+            "PARAKEET_INSTALL=ON requires AXIOM_INSTALL=ON because the "
+            "installed Parakeet target depends on Axiom::axiom. Remove "
+            "-DAXIOM_INSTALL=OFF or set it to ON.")
+    endif()
+    set(AXIOM_INSTALL ON CACHE BOOL
+        "Generate Axiom install exports when parakeet.cpp is installed")
+elseif(NOT DEFINED CACHE{AXIOM_INSTALL})
+    # Bundled consumers do not need an Axiom install tree unless they opt in.
+    set(AXIOM_INSTALL OFF CACHE BOOL
+        "Generate Axiom install exports when parakeet.cpp is installed")
+endif()
 if(PARAKEET_BUILD_BENCHMARKS)
     set(AXIOM_BUILD_BENCHMARKS ON)
 else()
@@ -205,6 +220,13 @@ if(PARAKEET_BUILD_TESTS)
         PARAKEET_SAFE_DIRECT_MODEL_FIXTURE="${PARAKEET_SAFE_DIRECT_MODEL_FIXTURE}")
     add_test(NAME test_safe_direct_encoder COMMAND test_safe_direct_encoder
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+
+    add_test(
+        NAME test_install_options
+        COMMAND "${CMAKE_COMMAND}"
+            -DPARAKEET_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_install_options.cmake"
     )
 endif()
 

@@ -171,6 +171,32 @@ float max_abs_delta(const Tensor &actual, const Tensor &expected) {
     return maximum;
 }
 
+TEST(SafeDirectEncoder, DirectQkvRequiresIdenticalLogicalViews) {
+    const Tensor storage = Tensor::zeros({1, 5, 8}, DType::Float16);
+    const Tensor first = storage.slice({axiom::Slice(), axiom::Slice(0, 4),
+                                        axiom::Slice()});
+    const Tensor shifted = storage.slice({axiom::Slice(), axiom::Slice(1, 5),
+                                          axiom::Slice()});
+
+    ASSERT_EQ(first.shape(), shifted.shape());
+    ASSERT_TRUE(first.shares_storage(shifted));
+    ASSERT_NE(first.offset(), shifted.offset());
+    EXPECT_FALSE(::parakeet::models::detail::shares_direct_qkv_input(
+        first, shifted, first));
+
+    const Tensor square = Tensor::zeros({1, 4, 4}, DType::Float16);
+    const Tensor transposed = square.transpose({0, 2, 1});
+
+    ASSERT_EQ(square.shape(), transposed.shape());
+    ASSERT_TRUE(square.shares_storage(transposed));
+    ASSERT_NE(square.strides(), transposed.strides());
+    EXPECT_FALSE(::parakeet::models::detail::shares_direct_qkv_input(
+        square, transposed, square));
+
+    EXPECT_TRUE(::parakeet::models::detail::shares_direct_qkv_input(
+        first, first, first));
+}
+
 TEST(SafeDirectEncoder, UnsupportedHeadDimensionUsesGenericInt8Projections) {
 #ifndef AXIOM_METAL_SUPPORT
     GTEST_SKIP() << "Metal/GPU not available";
