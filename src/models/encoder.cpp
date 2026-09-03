@@ -56,50 +56,21 @@ void mark_cached_position_head_layout_cache_hit() {
     }
 }
 
-bool has_compatible_int8_projection(const Linear &projection, size_t hidden) {
-    if (!projection.has_scale()) {
-        return false;
-    }
-    const Tensor &weight = projection.weight();
-    const Tensor &scale = projection.scale();
-    if (weight.device() != Device::GPU || weight.dtype() != DType::Int8 ||
-        !weight.is_contiguous() || weight.shape() != Shape{hidden, hidden} ||
-        scale.device() != Device::GPU || scale.dtype() != DType::Float16 ||
-        !scale.is_contiguous() || scale.shape() != Shape{hidden, hidden / 32}) {
-        return false;
-    }
-    if (!projection.has_bias() || !projection.bias().storage()) {
-        return true;
-    }
-    const Tensor &bias = projection.bias();
-    return bias.device() == Device::GPU && bias.dtype() == DType::Float16 &&
-           bias.is_contiguous() && bias.shape() == Shape{hidden};
-}
-
-bool can_use_direct_qkv_head_layout(const Tensor &query, const Tensor &key,
-                                    const Tensor &value,
-                                    const Linear &q_projection,
-                                    const Linear &k_projection,
-                                    const Linear &v_projection,
-                                    size_t num_heads) {
-    if (query.device() != Device::GPU || query.dtype() != DType::Float16 ||
-        query.ndim() != 3 || !query.is_contiguous() ||
-        query.shape() != key.shape() || query.shape() != value.shape() ||
-        !query.shares_storage(key) || !query.shares_storage(value) ||
-        query.shape()[0] == 0 || query.shape()[1] == 0 ||
-        query.shape()[2] == 0) {
-        return false;
-    }
-    const size_t hidden = query.shape()[2];
-    return hidden % 32 == 0 && num_heads > 0 && hidden % num_heads == 0 &&
-           (hidden / num_heads) % 4 == 0 &&
-           has_compatible_int8_projection(q_projection, hidden) &&
-           has_compatible_int8_projection(k_projection, hidden) &&
-           has_compatible_int8_projection(v_projection, hidden);
-}
-
 Tensor projection_bias(const Linear &projection) {
     return projection.has_bias() ? projection.bias() : Tensor();
+}
+
+ops::Int8Projection int8_projection(const Linear &projection) {
+    return {projection.weight(), projection.scale(), projection_bias(projection)};
+}
+
+bool shares_direct_qkv_input(const Tensor &query, const Tensor &key,
+                             const Tensor &value) {
+    // The fused Axiom kernel consumes one activation. Rel-position attention
+    // may use three inputs in general, so preserve the generic path unless
+    // all three views describe the same underlying activations.
+    return query.shape() == key.shape() && query.shape() == value.shape() &&
+           query.shares_storage(key) && query.shares_storage(value);
 }
 
 bool can_use_direct_silu(const Tensor &activation,
@@ -370,19 +341,20 @@ Tensor ConformerAttention::rel_position_attention(const Tensor &query,
     const auto &k_projection = mha_.k_proj();
     const auto &v_projection = mha_.v_proj();
     const size_t num_heads_size = static_cast<size_t>(num_heads);
-    const bool direct_qkv_head_layout = can_use_direct_qkv_head_layout(
-        query, key, value, q_projection, k_projection, v_projection,
-        num_heads_size);
+    const ops::Int8QkvProjections qkv_projections = {
+        int8_projection(q_projection), int8_projection(k_projection),
+        int8_projection(v_projection)};
+    const bool direct_qkv_head_layout =
+        shares_direct_qkv_input(query, key, value) &&
+        ops::int8_qkv_head_layout_eligibility(query, qkv_projections,
+                                              num_heads_size) ==
+            ops::Int8QkvHeadLayoutEligibility::Eligible;
 
     Tensor q, k, v;
     if (direct_qkv_head_layout) {
         PARAKEET_SP_BEGIN(QKVProj);
         auto projections = ops::int8_qkv_matmul_bias_head_layout(
-            query, q_projection.weight(), q_projection.scale(),
-            projection_bias(q_projection), k_projection.weight(),
-            k_projection.scale(), projection_bias(k_projection),
-            v_projection.weight(), v_projection.scale(),
-            projection_bias(v_projection), num_heads_size);
+            query, qkv_projections, num_heads_size);
         q = std::move(projections[0]);
         k = std::move(projections[1]);
         v = std::move(projections[2]);
