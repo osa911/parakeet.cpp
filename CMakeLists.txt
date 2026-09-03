@@ -27,22 +27,40 @@ option(PARAKEET_INSTALL "Generate install rules for parakeet" OFF)
 # ── Axiom ────────────────────────────────────────────────────────────────────
 set(AXIOM_BUILD_TESTS OFF)
 set(AXIOM_BUILD_EXAMPLES OFF)
+
+# Parakeet owns the default Axiom install setting only when it introduced the
+# setting itself. The marker distinguishes that managed cache value from an
+# explicit parent-scope value or a user's -DAXIOM_INSTALL=... choice.
+set(_parakeet_manages_axiom_install OFF)
+if(DEFINED CACHE{PARAKEET_MANAGED_AXIOM_INSTALL} AND
+   PARAKEET_MANAGED_AXIOM_INSTALL)
+    set(_parakeet_manages_axiom_install ON)
+endif()
+
 if(PARAKEET_INSTALL)
     # A Parakeet package exports a public dependency on Axiom::axiom. Do not
     # silently override an explicit request to omit Axiom's export; that would
     # create an install tree that configures but cannot be consumed.
-    if(DEFINED CACHE{AXIOM_INSTALL} AND NOT AXIOM_INSTALL)
+    if(DEFINED AXIOM_INSTALL AND NOT AXIOM_INSTALL AND
+       NOT _parakeet_manages_axiom_install)
         message(FATAL_ERROR
             "PARAKEET_INSTALL=ON requires AXIOM_INSTALL=ON because the "
             "installed Parakeet target depends on Axiom::axiom. Remove "
             "-DAXIOM_INSTALL=OFF or set it to ON.")
     endif()
-    set(AXIOM_INSTALL ON CACHE BOOL
-        "Generate Axiom install exports when parakeet.cpp is installed")
-elseif(NOT DEFINED CACHE{AXIOM_INSTALL})
+    if(_parakeet_manages_axiom_install OR NOT DEFINED AXIOM_INSTALL)
+        set(AXIOM_INSTALL ON CACHE BOOL
+            "Generate Axiom install exports when parakeet.cpp is installed"
+            FORCE)
+        set(PARAKEET_MANAGED_AXIOM_INSTALL ON CACHE INTERNAL
+            "Whether Parakeet owns AXIOM_INSTALL in this build tree")
+    endif()
+elseif(NOT DEFINED AXIOM_INSTALL)
     # Bundled consumers do not need an Axiom install tree unless they opt in.
     set(AXIOM_INSTALL OFF CACHE BOOL
         "Generate Axiom install exports when parakeet.cpp is installed")
+    set(PARAKEET_MANAGED_AXIOM_INSTALL ON CACHE INTERNAL
+        "Whether Parakeet owns AXIOM_INSTALL in this build tree")
 endif()
 if(PARAKEET_BUILD_BENCHMARKS)
     set(AXIOM_BUILD_BENCHMARKS ON)
@@ -177,6 +195,9 @@ if(PARAKEET_BUILD_TESTS)
         GIT_TAG v1.14.0
     )
     set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    # Test-only dependencies must not leak into a Parakeet install tree.
+    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+    set(INSTALL_GMOCK OFF CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(googletest)
 
     enable_testing()
@@ -228,6 +249,17 @@ if(PARAKEET_BUILD_TESTS)
             -DPARAKEET_SOURCE_DIR=${CMAKE_SOURCE_DIR}
             -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_install_options.cmake"
     )
+
+    if(PARAKEET_INSTALL)
+        add_test(
+            NAME test_install_consumer
+            COMMAND "${CMAKE_COMMAND}"
+                "-DPARAKEET_BINARY_DIR=${CMAKE_BINARY_DIR}"
+                "-DPARAKEET_CONSUMER_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/tests/install_consumer"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_install_consumer.cmake"
+        )
+        set_tests_properties(test_install_consumer PROPERTIES TIMEOUT 180)
+    endif()
 endif()
 
 # ── Examples ─────────────────────────────────────────────────────────────────
