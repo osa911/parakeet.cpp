@@ -26,6 +26,8 @@ option(BUILD_SHARED_LIBS "Build shared library instead of static" OFF)
 # ── Axiom ────────────────────────────────────────────────────────────────────
 set(AXIOM_BUILD_TESTS OFF)
 set(AXIOM_BUILD_EXAMPLES OFF)
+set(AXIOM_INSTALL OFF CACHE BOOL
+    "Do not generate Axiom install exports when it is vendored by parakeet.cpp" FORCE)
 if(PARAKEET_BUILD_BENCHMARKS)
     set(AXIOM_BUILD_BENCHMARKS ON)
 else()
@@ -97,7 +99,7 @@ endif()
 # parakeet into a single-archive distribution can disable install rules
 # (otherwise install(EXPORT ...) requires axiom + ggml etc. to be in
 # export sets, which they aren't when bundled).
-option(PARAKEET_INSTALL "Generate install rules for parakeet" ON)
+option(PARAKEET_INSTALL "Generate install rules for parakeet" OFF)
 
 if(PARAKEET_INSTALL)
 install(TARGETS parakeet_lib
