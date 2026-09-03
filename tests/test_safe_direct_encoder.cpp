@@ -30,9 +30,7 @@ using axiom::Device;
 using axiom::DType;
 using axiom::Shape;
 using axiom::Tensor;
-using parakeet::models::EncoderExecutionConfig;
 using parakeet::models::EncoderRouteStats;
-using parakeet::models::EncoderWorkspaceMode;
 using parakeet::models::FastConformerEncoder;
 
 bool starts_with(std::string_view value, std::string_view prefix) {
@@ -131,16 +129,12 @@ struct EncoderRun {
 
 EncoderRun run_encoder(const std::map<std::string, Tensor> &weights,
                        std::string_view prefix,
-                       EncoderWorkspaceMode workspace_mode,
                        bool generic_control, bool repeat_forward = false) {
     const std::string run_name = generic_control ? "generic control"
-                                 : workspace_mode == EncoderWorkspaceMode::Boost
-                                     ? "Boost"
-                                     : "LowerMemory";
+                                                 : "Safe Direct";
     SCOPED_TRACE(run_name);
     const auto config = parakeet::models::make_tdt_600m_config().encoder;
-    const EncoderExecutionConfig execution{.workspace_mode = workspace_mode};
-    FastConformerEncoder encoder(config, execution);
+    FastConformerEncoder encoder(config);
     auto prepared = prepare_encoder_weights(weights, prefix, generic_control);
     encoder.load_state_dict(prepared, std::string(prefix), /*strict=*/false);
 
@@ -317,37 +311,18 @@ TEST(SafeDirectEncoder, ProductionInt8RoutesMatchGenericControl) {
     const std::string prefix = encoder_prefix(weights);
 
     const EncoderRun control =
-        run_encoder(weights, prefix, EncoderWorkspaceMode::LowerMemory,
-                    /*generic_control=*/true);
-    const EncoderRun lower_memory =
-        run_encoder(weights, prefix, EncoderWorkspaceMode::LowerMemory,
-                    /*generic_control=*/false);
-    const EncoderRun boost =
-        run_encoder(weights, prefix, EncoderWorkspaceMode::Boost,
-                    /*generic_control=*/false, /*repeat_forward=*/true);
+        run_encoder(weights, prefix, /*generic_control=*/true);
+    const EncoderRun safe_direct =
+        run_encoder(weights, prefix, /*generic_control=*/false,
+                    /*repeat_forward=*/true);
 
     EXPECT_LE(
-        max_abs_delta(lower_memory.encoder_output(), control.encoder_output()),
-        5e-4f);
-    EXPECT_LE(max_abs_delta(boost.encoder_output(), control.encoder_output()),
-              5e-4f);
-    EXPECT_LE(
-        max_abs_delta(lower_memory.encoder_output(), boost.encoder_output()),
+        max_abs_delta(safe_direct.encoder_output(), control.encoder_output()),
         5e-4f);
 
-    EXPECT_TRUE(lower_memory.route_stats().direct_qkv_head_layout_used);
-    EXPECT_TRUE(lower_memory.route_stats().direct_silu_used);
-    EXPECT_TRUE(lower_memory.route_stats().cached_position_head_layout_used);
-    EXPECT_FALSE(lower_memory.route_stats().bounded_workspace_used);
-    EXPECT_FALSE(lower_memory.route_stats().process_wide_workspace_used);
-
-    EXPECT_TRUE(boost.route_stats().direct_qkv_head_layout_used);
-    EXPECT_TRUE(boost.route_stats().direct_silu_used);
-    EXPECT_TRUE(boost.route_stats().cached_position_head_layout_used);
-    EXPECT_TRUE(boost.route_stats().bounded_workspace_used);
-    EXPECT_TRUE(boost.route_stats().process_wide_workspace_used)
-        << "Boost must select the process-wide serialized workspace pool so the "
-           "server memory bound holds across HTTP worker threads";
+    EXPECT_TRUE(safe_direct.route_stats().direct_qkv_head_layout_used);
+    EXPECT_TRUE(safe_direct.route_stats().direct_silu_used);
+    EXPECT_TRUE(safe_direct.route_stats().cached_position_head_layout_used);
 }
 
 TEST(SafeDirectEncoder, RetainsPositionHeadLayoutsAcrossActiveBuckets) {
@@ -364,10 +339,7 @@ TEST(SafeDirectEncoder, RetainsPositionHeadLayoutsAcrossActiveBuckets) {
     const auto weights = axiom::io::safetensors::load(fixture.string());
     const std::string prefix = encoder_prefix(weights);
     const auto config = parakeet::models::make_tdt_600m_config().encoder;
-    FastConformerEncoder encoder(
-        config,
-        EncoderExecutionConfig{
-            .workspace_mode = EncoderWorkspaceMode::LowerMemory});
+    FastConformerEncoder encoder(config);
     auto prepared = prepare_encoder_weights(weights, prefix, /*generic_control=*/false);
     encoder.load_state_dict(prepared, prefix, /*strict=*/false);
 

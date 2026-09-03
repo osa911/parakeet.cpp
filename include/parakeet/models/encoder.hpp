@@ -24,8 +24,6 @@ struct EncoderRouteStats {
     bool direct_silu_used = false;
     bool cached_position_head_layout_used = false;
     bool cached_position_head_layout_cache_hit = false;
-    bool bounded_workspace_used = false;
-    bool process_wide_workspace_used = false;
 };
 
 // ─── Feed-Forward Module (Macaron-style half-step) ──────────────────────────
@@ -239,8 +237,7 @@ class ConvSubsampling : public Module {
 
 class FastConformerEncoder : public Module {
   public:
-    explicit FastConformerEncoder(const EncoderConfig &config = {},
-                                  EncoderExecutionConfig execution = {});
+    explicit FastConformerEncoder(const EncoderConfig &config = {});
 
     Tensor forward(const Tensor &input, const Tensor &mask = Tensor()) const;
     Tensor operator()(const Tensor &input,
@@ -284,7 +281,6 @@ class FastConformerEncoder : public Module {
 
   private:
     EncoderConfig config_;
-    EncoderExecutionConfig execution_;
     ConvSubsampling subsampling_;
     ModuleList layers_;
 

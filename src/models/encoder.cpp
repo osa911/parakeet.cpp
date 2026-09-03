@@ -56,18 +56,6 @@ void mark_cached_position_head_layout_cache_hit() {
     }
 }
 
-void mark_bounded_workspace() {
-    if (active_route_stats != nullptr) {
-        active_route_stats->bounded_workspace_used = true;
-    }
-}
-
-void mark_process_wide_workspace() {
-    if (active_route_stats != nullptr) {
-        active_route_stats->process_wide_workspace_used = true;
-    }
-}
-
 bool has_compatible_int8_projection(const Linear &projection, size_t hidden) {
     if (!projection.has_scale()) {
         return false;
@@ -302,7 +290,6 @@ ConformerAttention::projected_position_head_layout(const Tensor &pos_emb,
         return cache_hit->head_layout;
     }
 
-    ScopedGpuWorkspaceAllocationBypass persistent_allocation;
     Tensor projected = pos_proj_(pos_emb);
     const size_t pos_len = projected.shape()[0];
     const size_t hidden = projected.shape()[1];
@@ -641,10 +628,8 @@ Tensor ConvSubsampling::forward(const Tensor &input) const {
 
 // ─── FastConformerEncoder ───────────────────────────────────────────────────
 
-FastConformerEncoder::FastConformerEncoder(const EncoderConfig &config,
-                                           EncoderExecutionConfig execution)
-    : config_(config), execution_(execution),
-      subsampling_(config.subsampling_channels) {
+FastConformerEncoder::FastConformerEncoder(const EncoderConfig &config)
+    : config_(config), subsampling_(config.subsampling_channels) {
     for (int i = 0; i < config.num_layers; ++i) {
         layers_.emplace_back<ConformerBlock>(config);
     }
@@ -745,7 +730,6 @@ Tensor FastConformerEncoder::pos_emb(int seq_len, int d_model, DType dtype,
     PosEmbKey key{seq_len, d_model, dtype, device};
     auto it = pos_emb_cache_.find(key);
     if (it == pos_emb_cache_.end()) {
-        ScopedGpuWorkspaceAllocationBypass persistent_allocation;
         Tensor pe = axiom::nn::sinusoidal_position_embedding(
             seq_len, d_model, dtype, device);
         it = pos_emb_cache_.emplace(key, std::move(pe)).first;
@@ -781,17 +765,6 @@ Tensor FastConformerEncoder::forward(const Tensor &input,
     // Metal System Trace instrument for true GPU-side attribution.
     ForwardRouteStatsScope route_stats_scope;
 
-    std::unique_ptr<ScopedMetalWorkspace> workspace;
-    if (execution_.workspace_mode == EncoderWorkspaceMode::Boost) {
-        WorkspaceOptions options;
-        options.retained_limit_bytes = size_t{512} * 1024 * 1024;
-        options.storage_mode = WorkspaceStorageMode::Private;
-        options.cache_scope = WorkspaceCacheScope::ProcessWideSerialized;
-        workspace = std::make_unique<ScopedMetalWorkspace>(options);
-        mark_bounded_workspace();
-        mark_process_wide_workspace();
-    }
-
     PARAKEET_SP_BEGIN(Encoder);
 
     Tensor x;
@@ -820,22 +793,8 @@ Tensor FastConformerEncoder::forward(const Tensor &input,
 
     PARAKEET_SP_END(Encoder);
 
-    Tensor output;
-    if (workspace) {
-        // The returned tensor outlives this request. Copy it onto ordinary
-        // storage before releasing the last request-owned workspace lease.
-        {
-            ScopedGpuWorkspaceAllocationBypass persistent_allocation;
-            output = x.copy();
-        }
-        x = Tensor();
-        workspace->close();
-    } else {
-        output = std::move(x);
-    }
-
     last_route_stats_ = route_stats_scope.stats();
-    return output;
+    return x;
 }
 
 } // namespace parakeet::models
