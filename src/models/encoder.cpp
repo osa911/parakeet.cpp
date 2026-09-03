@@ -104,6 +104,7 @@ bool can_use_direct_qkv_head_layout(const Tensor &query, const Tensor &key,
     }
     const size_t hidden = query.shape()[2];
     return hidden % 32 == 0 && num_heads > 0 && hidden % num_heads == 0 &&
+           (hidden / num_heads) % 4 == 0 &&
            has_compatible_int8_projection(q_projection, hidden) &&
            has_compatible_int8_projection(k_projection, hidden) &&
            has_compatible_int8_projection(v_projection, hidden);

@@ -193,9 +193,9 @@ if(PARAKEET_BUILD_TESTS)
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     )
 
-    # Safe Direct model-level regression. The production INT8 checkpoint is
-    # intentionally external; an empty or unavailable path makes only the
-    # runtime test skip while this target still proves the public API compiles.
+    # Safe Direct regressions. Hermetic Direct-QKV fallback coverage always
+    # runs on Metal; the optional production INT8 fixture adds model-level
+    # parity and position-cache checks when it is available.
     set(PARAKEET_SAFE_DIRECT_MODEL_FIXTURE "" CACHE FILEPATH
         "Path to the production INT8 FastConformer safetensors fixture")
     add_executable(test_safe_direct_encoder tests/test_safe_direct_encoder.cpp)

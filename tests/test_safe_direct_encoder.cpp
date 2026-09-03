@@ -28,6 +28,7 @@ namespace {
 
 using axiom::Device;
 using axiom::DType;
+using axiom::Shape;
 using axiom::Tensor;
 using parakeet::models::EncoderExecutionConfig;
 using parakeet::models::EncoderRouteStats;
@@ -174,6 +175,131 @@ float max_abs_delta(const Tensor &actual, const Tensor &expected) {
             maximum, std::abs(actual_values[index] - expected_values[index]));
     }
     return maximum;
+}
+
+TEST(SafeDirectEncoder, UnsupportedHeadDimensionUsesGenericInt8Projections) {
+#ifndef AXIOM_METAL_SUPPORT
+    GTEST_SKIP() << "Metal/GPU not available";
+#else
+    // The Direct QKV Metal kernel requires head dimensions divisible by four.
+    // This one-layer encoder has a valid Int8 projection shape but head_dim ==
+    // 5. Its route statistics must show the established generic projections,
+    // rather than the Direct QKV kernel.
+    constexpr size_t hidden = 160;
+    constexpr size_t num_heads = 32;
+    constexpr size_t ffn_intermediate = 320;
+    constexpr size_t subsampling_channels = 32;
+
+    parakeet::models::EncoderConfig config;
+    config.mel_bins = 80;
+    config.subsampling_channels = static_cast<int>(subsampling_channels);
+    config.hidden_size = static_cast<int>(hidden);
+    config.num_layers = 1;
+    config.num_heads = static_cast<int>(num_heads);
+    config.ffn_intermediate = static_cast<int>(ffn_intermediate);
+    config.dropout = 0.0f;
+    FastConformerEncoder encoder(config);
+
+    std::map<std::string, Tensor> state;
+
+    const auto zeros = [](std::initializer_list<size_t> shape) {
+        return Tensor::zeros(Shape(std::vector<size_t>(shape)), DType::Float32);
+    };
+    const auto ones = [](std::initializer_list<size_t> shape) {
+        return Tensor::ones(Shape(std::vector<size_t>(shape)), DType::Float32);
+    };
+    const auto add_conv = [&](std::string_view name,
+                              std::initializer_list<size_t> shape) {
+        state.emplace(std::string(name) + ".weight", zeros(shape));
+        state.emplace(std::string(name) + ".bias", zeros({shape.begin()[0]}));
+    };
+
+    add_conv("subsampling_.conv1_", {subsampling_channels, 1, 3, 3});
+    add_conv("subsampling_.dw1_", {subsampling_channels, 1, 3, 3});
+    add_conv("subsampling_.conv2_",
+             {subsampling_channels, subsampling_channels, 1, 1});
+    add_conv("subsampling_.dw2_", {subsampling_channels, 1, 3, 3});
+    add_conv("subsampling_.conv3_",
+             {subsampling_channels, subsampling_channels, 1, 1});
+    state["subsampling_.proj_.weight"] =
+        zeros({hidden, subsampling_channels * 10});
+    state["subsampling_.proj_.bias"] = zeros({hidden});
+
+    constexpr std::string_view layer = "layers_.0.";
+    const auto add_norm = [&](std::string_view name) {
+        state.emplace(std::string(layer) + std::string(name) + ".weight",
+                      ones({hidden}));
+        state.emplace(std::string(layer) + std::string(name) + ".bias",
+                      zeros({hidden}));
+    };
+    const auto add_linear = [&](std::string_view name, size_t output,
+                                size_t input) {
+        state.emplace(std::string(layer) + std::string(name) + ".weight",
+                      zeros({output, input}));
+        state.emplace(std::string(layer) + std::string(name) + ".bias",
+                      zeros({output}));
+    };
+    const auto add_int8_linear = [&](std::string_view name, size_t output,
+                                     size_t input) {
+        state.emplace(std::string(layer) + std::string(name) + "_quantized",
+                      Tensor::zeros({output, input}, DType::Int8));
+        state.emplace(std::string(layer) + std::string(name) + "_scale",
+                      Tensor::ones({output, input / 32}, DType::Float16));
+    };
+
+    add_norm("ffn1_.norm_");
+    add_linear("ffn1_.fc1_", ffn_intermediate, hidden);
+    add_linear("ffn1_.fc2_", hidden, ffn_intermediate);
+    add_int8_linear("ffn1_.fc1_", ffn_intermediate, hidden);
+    add_int8_linear("ffn1_.fc2_", hidden, ffn_intermediate);
+
+    add_norm("attn_.norm_");
+    add_linear("attn_.mha_.q_proj", hidden, hidden);
+    add_linear("attn_.mha_.k_proj", hidden, hidden);
+    add_linear("attn_.mha_.v_proj", hidden, hidden);
+    add_linear("attn_.mha_.out_proj", hidden, hidden);
+    add_linear("attn_.pos_proj_", hidden, hidden);
+    state[std::string(layer) + "attn_.pos_bias_u_"] =
+        zeros({num_heads, hidden / num_heads});
+    state[std::string(layer) + "attn_.pos_bias_v_"] =
+        zeros({num_heads, hidden / num_heads});
+    add_int8_linear("attn_.mha_.q_proj", hidden, hidden);
+    add_int8_linear("attn_.mha_.k_proj", hidden, hidden);
+    add_int8_linear("attn_.mha_.v_proj", hidden, hidden);
+    add_int8_linear("attn_.mha_.out_proj", hidden, hidden);
+
+    add_norm("conv_.norm_");
+    add_conv("layers_.0.conv_.pointwise_conv1_", {2 * hidden, hidden, 1});
+    add_conv("layers_.0.conv_.depthwise_conv_", {hidden, 1, 9});
+    state[std::string(layer) + "conv_.batch_norm_.weight"] = ones({hidden});
+    state[std::string(layer) + "conv_.batch_norm_.bias"] = zeros({hidden});
+    state[std::string(layer) + "conv_.batch_norm_.running_mean"] =
+        zeros({hidden});
+    state[std::string(layer) + "conv_.batch_norm_.running_var"] =
+        ones({hidden});
+    state[std::string(layer) + "conv_.batch_norm_.num_batches_tracked"] =
+        zeros({1});
+    add_conv("layers_.0.conv_.pointwise_conv2_", {hidden, hidden, 1});
+
+    add_norm("ffn2_.norm_");
+    add_linear("ffn2_.fc1_", ffn_intermediate, hidden);
+    add_linear("ffn2_.fc2_", hidden, ffn_intermediate);
+    add_int8_linear("ffn2_.fc1_", ffn_intermediate, hidden);
+    add_int8_linear("ffn2_.fc2_", hidden, ffn_intermediate);
+    add_norm("final_norm_");
+
+    encoder.load_state_dict(state, "", /*strict=*/false);
+    encoder.to(DType::Float16);
+    encoder.to(Device::GPU);
+
+    const Tensor input = Tensor::ones({1, 32, 80}, DType::Float16, Device::GPU);
+
+    Tensor output;
+    EXPECT_NO_THROW(output = encoder.forward(input));
+    ASSERT_EQ(output.shape(), Shape({1, 4, hidden}));
+    EXPECT_EQ(output.to(Device::CPU).device(), Device::CPU);
+    EXPECT_FALSE(encoder.route_stats().direct_qkv_head_layout_used);
+#endif
 }
 
 TEST(SafeDirectEncoder, ProductionInt8RoutesMatchGenericControl) {
