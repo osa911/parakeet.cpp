@@ -32,46 +32,67 @@ if(_required_message_index EQUAL -1)
         "${_configure_output}")
 endif()
 
-# Parakeet owns the initial AXIOM_INSTALL=OFF value for a non-install build.
-# Turning PARAKEET_INSTALL on later in the same build tree must promote that
-# managed value instead of mistaking it for an explicit user choice.
-set(_managed_build_dir "${_build_dir}-managed")
+# A normal non-install configuration supplies an in-memory default only. A
+# later install configuration in the same tree may choose its matching default.
+set(_default_build_dir "${_build_dir}-default")
 execute_process(
-    COMMAND "${CMAKE_COMMAND}" -S "${PARAKEET_SOURCE_DIR}" -B "${_managed_build_dir}"
+    COMMAND "${CMAKE_COMMAND}" -S "${PARAKEET_SOURCE_DIR}" -B "${_default_build_dir}"
             -DPARAKEET_BUILD_CLI=OFF
             -DPARAKEET_BUILD_TESTS=OFF
             -DPARAKEET_BUILD_EXAMPLES=OFF
             -DPARAKEET_INSTALL=OFF
-    RESULT_VARIABLE _managed_initial_result
-    OUTPUT_VARIABLE _managed_initial_stdout
-    ERROR_VARIABLE _managed_initial_stderr
+    RESULT_VARIABLE _default_initial_result
+    OUTPUT_VARIABLE _default_initial_stdout
+    ERROR_VARIABLE _default_initial_stderr
 )
-if(NOT _managed_initial_result EQUAL 0)
+if(NOT _default_initial_result EQUAL 0)
     message(FATAL_ERROR
         "Parakeet initial non-install configuration failed:\n"
-        "${_managed_initial_stdout}\n${_managed_initial_stderr}")
+        "${_default_initial_stdout}\n${_default_initial_stderr}")
 endif()
 
 execute_process(
-    COMMAND "${CMAKE_COMMAND}" -S "${PARAKEET_SOURCE_DIR}" -B "${_managed_build_dir}"
+    COMMAND "${CMAKE_COMMAND}" -S "${PARAKEET_SOURCE_DIR}" -B "${_default_build_dir}"
             -DPARAKEET_BUILD_CLI=OFF
             -DPARAKEET_BUILD_TESTS=OFF
             -DPARAKEET_BUILD_EXAMPLES=OFF
             -DPARAKEET_INSTALL=ON
-    RESULT_VARIABLE _managed_promote_result
-    OUTPUT_VARIABLE _managed_promote_stdout
-    ERROR_VARIABLE _managed_promote_stderr
+    RESULT_VARIABLE _default_promote_result
+    OUTPUT_VARIABLE _default_promote_stdout
+    ERROR_VARIABLE _default_promote_stderr
 )
-if(NOT _managed_promote_result EQUAL 0)
+if(NOT _default_promote_result EQUAL 0)
     message(FATAL_ERROR
-        "PARAKEET_INSTALL=ON must promote Parakeet's prior managed Axiom "
-        "install value:\n${_managed_promote_stdout}\n${_managed_promote_stderr}")
+        "PARAKEET_INSTALL=ON must use its default Axiom install value when "
+        "the caller has not supplied one:\n${_default_promote_stdout}\n${_default_promote_stderr}")
 endif()
 
-file(READ "${_managed_build_dir}/CMakeCache.txt" _managed_cache)
-if(NOT _managed_cache MATCHES "AXIOM_INSTALL:BOOL=ON")
+# An explicit later -DAXIOM_INSTALL=OFF is authoritative even after the prior
+# default-only configuration. This is the reconfigure regression: a persistent
+# Parakeet ownership marker used to overwrite this choice with ON.
+execute_process(
+    COMMAND "${CMAKE_COMMAND}" -S "${PARAKEET_SOURCE_DIR}" -B "${_default_build_dir}"
+            -DPARAKEET_BUILD_CLI=OFF
+            -DPARAKEET_BUILD_TESTS=OFF
+            -DPARAKEET_BUILD_EXAMPLES=OFF
+            -DPARAKEET_INSTALL=ON
+            -DAXIOM_INSTALL=OFF
+    RESULT_VARIABLE _explicit_off_result
+    OUTPUT_VARIABLE _explicit_off_stdout
+    ERROR_VARIABLE _explicit_off_stderr
+)
+if(_explicit_off_result EQUAL 0)
     message(FATAL_ERROR
-        "Promoting PARAKEET_INSTALL must set the managed AXIOM_INSTALL cache value to ON")
+        "PARAKEET_INSTALL=ON must reject a later explicit AXIOM_INSTALL=OFF")
+endif()
+
+set(_explicit_off_output "${_explicit_off_stdout}\n${_explicit_off_stderr}")
+string(FIND "${_explicit_off_output}" "PARAKEET_INSTALL=ON requires AXIOM_INSTALL=ON"
+       _explicit_required_message_index)
+if(_explicit_required_message_index EQUAL -1)
+    message(FATAL_ERROR
+        "The reconfigure failure must explain the required Axiom export:\n"
+        "${_explicit_off_output}")
 endif()
 
 # A parent project can set AXIOM_INSTALL as an ordinary (non-cache) variable.

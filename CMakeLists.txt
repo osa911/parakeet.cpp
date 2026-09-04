@@ -28,39 +28,24 @@ option(PARAKEET_INSTALL "Generate install rules for parakeet" OFF)
 set(AXIOM_BUILD_TESTS OFF)
 set(AXIOM_BUILD_EXAMPLES OFF)
 
-# Parakeet owns the default Axiom install setting only when it introduced the
-# setting itself. The marker distinguishes that managed cache value from an
-# explicit parent-scope value or a user's -DAXIOM_INSTALL=... choice.
-set(_parakeet_manages_axiom_install OFF)
-if(DEFINED CACHE{PARAKEET_MANAGED_AXIOM_INSTALL} AND
-   PARAKEET_MANAGED_AXIOM_INSTALL)
-    set(_parakeet_manages_axiom_install ON)
-endif()
-
 if(PARAKEET_INSTALL)
     # A Parakeet package exports a public dependency on Axiom::axiom. Do not
     # silently override an explicit request to omit Axiom's export; that would
     # create an install tree that configures but cannot be consumed.
-    if(DEFINED AXIOM_INSTALL AND NOT AXIOM_INSTALL AND
-       NOT _parakeet_manages_axiom_install)
+    if(DEFINED AXIOM_INSTALL AND NOT AXIOM_INSTALL)
         message(FATAL_ERROR
             "PARAKEET_INSTALL=ON requires AXIOM_INSTALL=ON because the "
             "installed Parakeet target depends on Axiom::axiom. Remove "
             "-DAXIOM_INSTALL=OFF or set it to ON.")
     endif()
-    if(_parakeet_manages_axiom_install OR NOT DEFINED AXIOM_INSTALL)
-        set(AXIOM_INSTALL ON CACHE BOOL
-            "Generate Axiom install exports when parakeet.cpp is installed"
-            FORCE)
-        set(PARAKEET_MANAGED_AXIOM_INSTALL ON CACHE INTERNAL
-            "Whether Parakeet owns AXIOM_INSTALL in this build tree")
+    if(NOT DEFINED AXIOM_INSTALL)
+        # This is a per-configuration default, not ownership of a cache
+        # setting. A later parent or -DAXIOM_INSTALL value remains authoritative.
+        set(AXIOM_INSTALL ON)
     endif()
 elseif(NOT DEFINED AXIOM_INSTALL)
     # Bundled consumers do not need an Axiom install tree unless they opt in.
-    set(AXIOM_INSTALL OFF CACHE BOOL
-        "Generate Axiom install exports when parakeet.cpp is installed")
-    set(PARAKEET_MANAGED_AXIOM_INSTALL ON CACHE INTERNAL
-        "Whether Parakeet owns AXIOM_INSTALL in this build tree")
+    set(AXIOM_INSTALL OFF)
 endif()
 if(PARAKEET_BUILD_BENCHMARKS)
     set(AXIOM_BUILD_BENCHMARKS ON)
