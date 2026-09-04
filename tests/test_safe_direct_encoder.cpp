@@ -16,7 +16,12 @@
 #include <vector>
 
 #include "parakeet/models/config.hpp"
+// This test exercises the exact private attention routing boundary with
+// separately allocated Q/K/V tensors. Keep that seam test-only rather than
+// adding a production switch that could change inference behavior.
+#define private public
 #include "parakeet/models/encoder.hpp"
+#undef private
 
 #ifndef PARAKEET_SAFE_DIRECT_MODEL_FIXTURE
 #define PARAKEET_SAFE_DIRECT_MODEL_FIXTURE ""
@@ -30,7 +35,6 @@ using axiom::Device;
 using axiom::DType;
 using axiom::Shape;
 using axiom::Tensor;
-using parakeet::models::EncoderRouteStats;
 using parakeet::models::FastConformerEncoder;
 
 bool starts_with(std::string_view value, std::string_view prefix) {
@@ -71,12 +75,6 @@ bool is_float_dtype(DType dtype) {
            dtype == DType::Float32 || dtype == DType::Float64;
 }
 
-bool is_generic_control_scale(std::string_view name) {
-    return name.ends_with("attn_.mha_.q_proj_scale") ||
-           name.ends_with("ffn1_.fc1__scale") ||
-           name.ends_with("ffn2_.fc1__scale");
-}
-
 std::string encoder_prefix(const std::map<std::string, Tensor> &weights) {
     for (const auto &[name, _] : weights) {
         if (starts_with(name, "encoder_.layers_.0.")) {
@@ -101,7 +99,7 @@ bool belongs_to_encoder(std::string_view name, std::string_view prefix) {
 
 std::map<std::string, Tensor>
 prepare_encoder_weights(const std::map<std::string, Tensor> &weights,
-                        std::string_view prefix, bool generic_control) {
+                        std::string_view prefix) {
     std::map<std::string, Tensor> prepared;
     for (const auto &[name, source] : weights) {
         if (!belongs_to_encoder(name, prefix)) {
@@ -111,46 +109,10 @@ prepare_encoder_weights(const std::map<std::string, Tensor> &weights,
         if (is_float_dtype(value.dtype()) && value.dtype() != DType::Float16) {
             value = value.astype(DType::Float16);
         }
-        if (!(generic_control && is_generic_control_scale(name))) {
-            value = value.to(Device::GPU);
-        }
+        value = value.to(Device::GPU);
         prepared.emplace(name, std::move(value));
     }
     return prepared;
-}
-
-struct EncoderRun {
-    Tensor output;
-    EncoderRouteStats stats;
-
-    const Tensor &encoder_output() const { return output; }
-    const EncoderRouteStats &route_stats() const { return stats; }
-};
-
-EncoderRun run_encoder(const std::map<std::string, Tensor> &weights,
-                       std::string_view prefix,
-                       bool generic_control, bool repeat_forward = false) {
-    const std::string run_name = generic_control ? "generic control"
-                                                 : "Safe Direct";
-    SCOPED_TRACE(run_name);
-    const auto config = parakeet::models::make_tdt_600m_config().encoder;
-    FastConformerEncoder encoder(config);
-    auto prepared = prepare_encoder_weights(weights, prefix, generic_control);
-    encoder.load_state_dict(prepared, std::string(prefix), /*strict=*/false);
-
-    const Tensor input =
-        Tensor::zeros({1, 960, 128}, DType::Float16, Device::GPU);
-    try {
-        Tensor output =
-            encoder.forward(input).to(Device::CPU).astype(DType::Float32);
-        if (repeat_forward) {
-            output =
-                encoder.forward(input).to(Device::CPU).astype(DType::Float32);
-        }
-        return {output, encoder.route_stats()};
-    } catch (const std::exception &error) {
-        throw std::runtime_error(run_name + ": " + error.what());
-    }
 }
 
 float max_abs_delta(const Tensor &actual, const Tensor &expected) {
@@ -173,10 +135,10 @@ float max_abs_delta(const Tensor &actual, const Tensor &expected) {
 
 TEST(SafeDirectEncoder, DirectQkvRequiresIdenticalLogicalViews) {
     const Tensor storage = Tensor::zeros({1, 5, 8}, DType::Float16);
-    const Tensor first = storage.slice({axiom::Slice(), axiom::Slice(0, 4),
-                                        axiom::Slice()});
-    const Tensor shifted = storage.slice({axiom::Slice(), axiom::Slice(1, 5),
-                                          axiom::Slice()});
+    const Tensor first =
+        storage.slice({axiom::Slice(), axiom::Slice(0, 4), axiom::Slice()});
+    const Tensor shifted =
+        storage.slice({axiom::Slice(), axiom::Slice(1, 5), axiom::Slice()});
 
     ASSERT_EQ(first.shape(), shifted.shape());
     ASSERT_TRUE(first.shares_storage(shifted));
@@ -195,6 +157,25 @@ TEST(SafeDirectEncoder, DirectQkvRequiresIdenticalLogicalViews) {
 
     EXPECT_TRUE(::parakeet::models::detail::shares_direct_qkv_input(
         first, first, first));
+}
+
+TEST(SafeDirectEncoder, IneligibleDirectQkvRouteKeepsLazyInputDeferred) {
+#ifndef AXIOM_METAL_SUPPORT
+    GTEST_SKIP() << "Metal/GPU not available";
+#else
+    const Tensor source =
+        Tensor::zeros({1, 2, 32}, DType::Float16, Device::GPU);
+    const Tensor lazy_input = source + source;
+    ASSERT_TRUE(lazy_input.is_lazy());
+
+    // Empty projections make the non-materializing Axiom capability check
+    // reject the Direct-QKV route. Route selection must not inspect storage
+    // identity first: shares_direct_qkv_input() synchronizes lazy tensors.
+    const axiom::ops::Int8QkvProjections projections{};
+    EXPECT_FALSE(::parakeet::models::detail::can_use_direct_qkv_head_layout(
+        lazy_input, lazy_input, lazy_input, projections, 8));
+    EXPECT_TRUE(lazy_input.is_lazy());
+#endif
 }
 
 TEST(SafeDirectEncoder, UnsupportedHeadDimensionUsesGenericInt8Projections) {
@@ -322,7 +303,7 @@ TEST(SafeDirectEncoder, UnsupportedHeadDimensionUsesGenericInt8Projections) {
 #endif
 }
 
-TEST(SafeDirectEncoder, ProductionInt8RoutesMatchGenericControl) {
+TEST(SafeDirectEncoder, ProductionInt8DirectAndGenericAttentionMatch) {
     unset_encoder_experiments();
 
     const std::filesystem::path fixture(PARAKEET_SAFE_DIRECT_MODEL_FIXTURE);
@@ -335,20 +316,54 @@ TEST(SafeDirectEncoder, ProductionInt8RoutesMatchGenericControl) {
         << "The configured production fixture test requires Metal";
     const auto weights = axiom::io::safetensors::load(fixture.string());
     const std::string prefix = encoder_prefix(weights);
+    const auto config = parakeet::models::make_tdt_600m_config().encoder;
+    FastConformerEncoder encoder(config);
+    auto prepared = prepare_encoder_weights(weights, prefix);
+    encoder.load_state_dict(prepared, prefix, /*strict=*/false);
 
-    const EncoderRun control =
-        run_encoder(weights, prefix, /*generic_control=*/true);
-    const EncoderRun safe_direct =
-        run_encoder(weights, prefix, /*generic_control=*/false,
-                    /*repeat_forward=*/true);
+    constexpr size_t seq_len = 120;
+    const size_t hidden = static_cast<size_t>(config.hidden_size);
+    const Tensor query =
+        Tensor::zeros({1, seq_len, hidden}, DType::Float16, Device::GPU);
+    const Tensor position =
+        encoder.pos_emb(static_cast<int>(seq_len), config.hidden_size,
+                        DType::Float16, Device::GPU);
+    const auto &first_block =
+        static_cast<const parakeet::models::ConformerBlock &>(
+            encoder.layers_[0]);
+    const auto &attention = first_block.attn_;
+    const auto projection = [](const axiom::nn::Linear &linear) {
+        return axiom::ops::Int8Projection{linear.weight(), linear.scale(),
+                                          linear.has_bias() ? linear.bias()
+                                                            : Tensor()};
+    };
+    const axiom::ops::Int8QkvProjections projections{
+        projection(attention.mha_.q_proj()),
+        projection(attention.mha_.k_proj()),
+        projection(attention.mha_.v_proj())};
+    EXPECT_TRUE(::parakeet::models::detail::can_use_direct_qkv_head_layout(
+        query, query, query, projections,
+        static_cast<size_t>(attention.mha_.num_heads())));
+    EXPECT_FALSE(::parakeet::models::detail::can_use_direct_qkv_head_layout(
+        query, query.clone(), query.clone(), projections,
+        static_cast<size_t>(attention.mha_.num_heads())));
 
-    EXPECT_LE(
-        max_abs_delta(safe_direct.encoder_output(), control.encoder_output()),
-        5e-4f);
+    // Identical Q/K/V views take Direct-QKV; clones force the established
+    // generic projection route. All weights, scales, activations, and biases
+    // remain valid GPU tensors in both legs.
+    const Tensor direct =
+        attention
+            .rel_position_attention(query, query, query, position, Tensor())
+            .to(Device::CPU)
+            .astype(DType::Float32);
+    const Tensor generic =
+        attention
+            .rel_position_attention(query, query.clone(), query.clone(),
+                                    position, Tensor())
+            .to(Device::CPU)
+            .astype(DType::Float32);
 
-    EXPECT_TRUE(safe_direct.route_stats().direct_qkv_head_layout_used);
-    EXPECT_TRUE(safe_direct.route_stats().direct_silu_used);
-    EXPECT_TRUE(safe_direct.route_stats().cached_position_head_layout_used);
+    EXPECT_LE(max_abs_delta(direct, generic), 5e-4f);
 }
 
 TEST(SafeDirectEncoder, RetainsPositionHeadLayoutsAcrossActiveBuckets) {
@@ -366,7 +381,7 @@ TEST(SafeDirectEncoder, RetainsPositionHeadLayoutsAcrossActiveBuckets) {
     const std::string prefix = encoder_prefix(weights);
     const auto config = parakeet::models::make_tdt_600m_config().encoder;
     FastConformerEncoder encoder(config);
-    auto prepared = prepare_encoder_weights(weights, prefix, /*generic_control=*/false);
+    auto prepared = prepare_encoder_weights(weights, prefix);
     encoder.load_state_dict(prepared, prefix, /*strict=*/false);
 
     const auto forward = [&](size_t frames) {

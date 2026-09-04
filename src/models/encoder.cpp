@@ -31,6 +31,19 @@ bool shares_direct_qkv_input(const Tensor &query, const Tensor &key,
     return same_view_as_query(key) && same_view_as_query(value);
 }
 
+bool can_use_direct_qkv_head_layout(const Tensor &query, const Tensor &key,
+                                    const Tensor &value,
+                                    const ops::Int8QkvProjections &projections,
+                                    size_t num_heads) {
+    // Keep this non-materializing check first. shares_direct_qkv_input()
+    // inspects storage and would otherwise synchronize deferred GPU inputs
+    // which are about to take the generic projection path.
+    return ops::int8_qkv_head_layout_eligibility(query, projections,
+                                                 num_heads) ==
+               ops::Int8QkvHeadLayoutEligibility::Eligible &&
+           shares_direct_qkv_input(query, key, value);
+}
+
 } // namespace detail
 
 namespace {
@@ -81,7 +94,8 @@ Tensor projection_bias(const Linear &projection) {
 }
 
 ops::Int8Projection int8_projection(const Linear &projection) {
-    return {projection.weight(), projection.scale(), projection_bias(projection)};
+    return {projection.weight(), projection.scale(),
+            projection_bias(projection)};
 }
 
 bool can_use_direct_silu(const Tensor &activation,
@@ -143,11 +157,9 @@ bool FeedForward::all_int8_on(Device d) const {
     // Tensors with no storage abstain (vote true vacuously). On a non-int8
     // FeedForward no scales are loaded, so this always returns true.
     // On a fully loaded int8 FeedForward, all four tensors must agree with `d`.
-    auto on = [&](const Tensor &t) {
-        return !t.storage() || t.device() == d;
-    };
-    return on(fc1_.weight()) && on(fc1_.scale()) &&
-           on(fc2_.weight()) && on(fc2_.scale());
+    auto on = [&](const Tensor &t) { return !t.storage() || t.device() == d; };
+    return on(fc1_.weight()) && on(fc1_.scale()) && on(fc2_.weight()) &&
+           on(fc2_.scale());
 }
 
 Tensor FeedForward::forward(const Tensor &input) const {
@@ -212,7 +224,8 @@ void ConformerAttention::load_int8_weights(Tensor q_int8, Tensor q_scale,
     const_cast<Linear &>(mha_.k_proj()).load_int8_weights(k_int8, k_scale);
     const_cast<Linear &>(mha_.v_proj()).load_int8_weights(v_int8, v_scale);
     const_cast<Linear &>(mha_.out_proj()).load_int8_weights(o_int8, o_scale);
-    // is_int8() is now derived from mha_.q_proj().has_scale() + dtype; no flag to set.
+    // is_int8() is now derived from mha_.q_proj().has_scale() + dtype; no flag
+    // to set.
 }
 
 Device ConformerAttention::int8_weights_device() const {
@@ -226,12 +239,10 @@ bool ConformerAttention::all_int8_on(Device d) const {
     // See FeedForward::all_int8_on() for the abstention rule. On a fully
     // loaded int8 ConformerAttention, all 8 tensors (4 weights + 4 scales)
     // must agree with `d`.
-    auto on = [&](const Tensor &t) {
-        return !t.storage() || t.device() == d;
-    };
-    return on(mha_.q_proj().weight())   && on(mha_.q_proj().scale())   &&
-           on(mha_.k_proj().weight())   && on(mha_.k_proj().scale())   &&
-           on(mha_.v_proj().weight())   && on(mha_.v_proj().scale())   &&
+    auto on = [&](const Tensor &t) { return !t.storage() || t.device() == d; };
+    return on(mha_.q_proj().weight()) && on(mha_.q_proj().scale()) &&
+           on(mha_.k_proj().weight()) && on(mha_.k_proj().scale()) &&
+           on(mha_.v_proj().weight()) && on(mha_.v_proj().scale()) &&
            on(mha_.out_proj().weight()) && on(mha_.out_proj().scale());
 }
 
@@ -279,17 +290,16 @@ ConformerAttention::projected_position_head_layout(const Tensor &pos_emb,
                     .transpose({0, 2, 1, 3})
                     .ascontiguousarray();
     static_cast<void>(projected.storage());
-    PositionProjectionCacheEntry entry{
-        pos_emb, std::move(projected), num_heads,
-        ++position_projection_cache_clock_};
-    if (position_projection_cache_.size() >=
-        kPositionProjectionCacheCapacity) {
-        const auto eviction = std::min_element(
-            position_projection_cache_.begin(), position_projection_cache_.end(),
-            [](const PositionProjectionCacheEntry &left,
-               const PositionProjectionCacheEntry &right) {
-                return left.last_used < right.last_used;
-            });
+    PositionProjectionCacheEntry entry{pos_emb, std::move(projected), num_heads,
+                                       ++position_projection_cache_clock_};
+    if (position_projection_cache_.size() >= kPositionProjectionCacheCapacity) {
+        const auto eviction =
+            std::min_element(position_projection_cache_.begin(),
+                             position_projection_cache_.end(),
+                             [](const PositionProjectionCacheEntry &left,
+                                const PositionProjectionCacheEntry &right) {
+                                 return left.last_used < right.last_used;
+                             });
         *eviction = std::move(entry);
         mark_cached_position_head_layout();
         return eviction->head_layout;
@@ -355,11 +365,8 @@ Tensor ConformerAttention::rel_position_attention(const Tensor &query,
     const ops::Int8QkvProjections qkv_projections = {
         int8_projection(q_projection), int8_projection(k_projection),
         int8_projection(v_projection)};
-    const bool direct_qkv_head_layout =
-        detail::shares_direct_qkv_input(query, key, value) &&
-        ops::int8_qkv_head_layout_eligibility(query, qkv_projections,
-                                              num_heads_size) ==
-            ops::Int8QkvHeadLayoutEligibility::Eligible;
+    const bool direct_qkv_head_layout = detail::can_use_direct_qkv_head_layout(
+        query, key, value, qkv_projections, num_heads_size);
 
     Tensor q, k, v;
     if (direct_qkv_head_layout) {
@@ -483,7 +490,8 @@ Tensor ConformerAttention::rel_position_attention(const Tensor &query,
     out = out.transpose({0, 2, 1, 3});
     out = out.reshape({batch, seq_len, static_cast<size_t>(d_model)});
 
-    // Output projection — Linear::forward() handles int8 dispatch automatically.
+    // Output projection — Linear::forward() handles int8 dispatch
+    // automatically.
     {
         PARAKEET_SP_BEGIN(OutProj);
         out = mha_.out_proj()(out);
@@ -509,28 +517,24 @@ ConformerBlock::ConformerBlock(const EncoderConfig &config)
 }
 
 void ConformerBlock::load_int8_weights(
-    Tensor q_int8, Tensor q_scale,
-    Tensor k_int8, Tensor k_scale,
-    Tensor v_int8, Tensor v_scale,
-    Tensor o_int8, Tensor o_scale,
-    Tensor ffn1_fc1_int8, Tensor ffn1_fc1_scale,
-    Tensor ffn1_fc2_int8, Tensor ffn1_fc2_scale,
-    Tensor ffn2_fc1_int8, Tensor ffn2_fc1_scale,
-    Tensor ffn2_fc2_int8, Tensor ffn2_fc2_scale) {
+    Tensor q_int8, Tensor q_scale, Tensor k_int8, Tensor k_scale, Tensor v_int8,
+    Tensor v_scale, Tensor o_int8, Tensor o_scale, Tensor ffn1_fc1_int8,
+    Tensor ffn1_fc1_scale, Tensor ffn1_fc2_int8, Tensor ffn1_fc2_scale,
+    Tensor ffn2_fc1_int8, Tensor ffn2_fc1_scale, Tensor ffn2_fc2_int8,
+    Tensor ffn2_fc2_scale) {
 
-    attn_.load_int8_weights(
-        std::move(q_int8),  std::move(q_scale),
-        std::move(k_int8),  std::move(k_scale),
-        std::move(v_int8),  std::move(v_scale),
-        std::move(o_int8),  std::move(o_scale));
+    attn_.load_int8_weights(std::move(q_int8), std::move(q_scale),
+                            std::move(k_int8), std::move(k_scale),
+                            std::move(v_int8), std::move(v_scale),
+                            std::move(o_int8), std::move(o_scale));
 
-    ffn1_.load_int8_weights(
-        std::move(ffn1_fc1_int8), std::move(ffn1_fc1_scale),
-        std::move(ffn1_fc2_int8), std::move(ffn1_fc2_scale));
+    ffn1_.load_int8_weights(std::move(ffn1_fc1_int8), std::move(ffn1_fc1_scale),
+                            std::move(ffn1_fc2_int8),
+                            std::move(ffn1_fc2_scale));
 
-    ffn2_.load_int8_weights(
-        std::move(ffn2_fc1_int8), std::move(ffn2_fc1_scale),
-        std::move(ffn2_fc2_int8), std::move(ffn2_fc2_scale));
+    ffn2_.load_int8_weights(std::move(ffn2_fc1_int8), std::move(ffn2_fc1_scale),
+                            std::move(ffn2_fc2_int8),
+                            std::move(ffn2_fc2_scale));
 }
 
 void ConformerBlock::clear_position_projection_cache() {
@@ -620,8 +624,8 @@ FastConformerEncoder::FastConformerEncoder(const EncoderConfig &config)
 }
 
 void FastConformerEncoder::load_state_dict(
-    const std::map<std::string, Tensor> &state_dict,
-    const std::string &prefix, bool strict) {
+    const std::map<std::string, Tensor> &state_dict, const std::string &prefix,
+    bool strict) {
 
     // Reloading weights can change dtype/device of subsequent forwards;
     // cache entries from the previous configuration would never hit again.
@@ -639,8 +643,7 @@ void FastConformerEncoder::load_state_dict(
     for (const auto &entry : state_dict) {
         const std::string &name = entry.first;
         if (name.size() >= kQuantizedSuffix.size() &&
-            name.ends_with(kQuantizedSuffix) &&
-            name.rfind(prefix, 0) == 0) {
+            name.ends_with(kQuantizedSuffix) && name.rfind(prefix, 0) == 0) {
             is_int8_ = true;
             break;
         }
@@ -659,8 +662,8 @@ void FastConformerEncoder::load_int8_weights_(
     auto get = [&](const std::string &key) -> Tensor {
         auto it = state_dict.find(key);
         if (it == state_dict.end()) {
-            throw RuntimeError::internal(
-                "int8 weight key '" + key + "' not found in state_dict");
+            throw RuntimeError::internal("int8 weight key '" + key +
+                                         "' not found in state_dict");
         }
         return it->second;
     };
@@ -686,20 +689,20 @@ void FastConformerEncoder::load_int8_weights_(
         const std::string f1p = lp + "ffn1_.";
         const std::string f2p = lp + "ffn2_.";
 
-        auto &block = static_cast<ConformerBlock &>(layers_[static_cast<size_t>(i)]);
+        auto &block =
+            static_cast<ConformerBlock &>(layers_[static_cast<size_t>(i)]);
         block.load_int8_weights(
             // attention q/k/v/out_proj
-            get(ap + "q_proj_quantized"),   get(ap + "q_proj_scale"),
-            get(ap + "k_proj_quantized"),   get(ap + "k_proj_scale"),
-            get(ap + "v_proj_quantized"),   get(ap + "v_proj_scale"),
+            get(ap + "q_proj_quantized"), get(ap + "q_proj_scale"),
+            get(ap + "k_proj_quantized"), get(ap + "k_proj_scale"),
+            get(ap + "v_proj_quantized"), get(ap + "v_proj_scale"),
             get(ap + "out_proj_quantized"), get(ap + "out_proj_scale"),
             // ffn1 fc1 / fc2
             get(f1p + "fc1__quantized"), get(f1p + "fc1__scale"),
             get(f1p + "fc2__quantized"), get(f1p + "fc2__scale"),
             // ffn2 fc1 / fc2
             get(f2p + "fc1__quantized"), get(f2p + "fc1__scale"),
-            get(f2p + "fc2__quantized"), get(f2p + "fc2__scale")
-        );
+            get(f2p + "fc2__quantized"), get(f2p + "fc2__scale"));
     }
 }
 
@@ -713,8 +716,8 @@ Tensor FastConformerEncoder::pos_emb(int seq_len, int d_model, DType dtype,
     PosEmbKey key{seq_len, d_model, dtype, device};
     auto it = pos_emb_cache_.find(key);
     if (it == pos_emb_cache_.end()) {
-        Tensor pe = axiom::nn::sinusoidal_position_embedding(
-            seq_len, d_model, dtype, device);
+        Tensor pe = axiom::nn::sinusoidal_position_embedding(seq_len, d_model,
+                                                             dtype, device);
         it = pos_emb_cache_.emplace(key, std::move(pe)).first;
     }
     return it->second;

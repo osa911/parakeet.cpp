@@ -34,6 +34,14 @@ namespace detail {
 bool shares_direct_qkv_input(const Tensor &query, const Tensor &key,
                              const Tensor &value);
 
+// Selects the fused Direct-QKV route without materializing an ineligible lazy
+// input. The Axiom capability check is deliberately first: storage identity is
+// only needed after the route is known to be otherwise valid.
+bool can_use_direct_qkv_head_layout(const Tensor &query, const Tensor &key,
+                                    const Tensor &value,
+                                    const ops::Int8QkvProjections &projections,
+                                    size_t num_heads);
+
 } // namespace detail
 
 // ─── Feed-Forward Module (Macaron-style half-step) ──────────────────────────
@@ -113,8 +121,9 @@ class ConformerAttention : public Module {
     }
 
     // Called by FastConformerEncoder::load_state_dict when int8 weights are
-    // detected. Delegates to mha_.q_proj/k_proj/v_proj/out_proj.load_int8_weights()
-    // so Linear::forward() dispatches automatically through the int8 fast path.
+    // detected. Delegates to
+    // mha_.q_proj/k_proj/v_proj/out_proj.load_int8_weights() so
+    // Linear::forward() dispatches automatically through the int8 fast path.
     void load_int8_weights(Tensor q_int8, Tensor q_scale, Tensor k_int8,
                            Tensor k_scale, Tensor v_int8, Tensor v_scale,
                            Tensor o_int8, Tensor o_scale);
@@ -193,16 +202,14 @@ class ConformerBlock : public Module {
     // FeedForward::load_int8_weights.
     void load_int8_weights(
         // Attention: q, k, v, out_proj
-        Tensor q_int8, Tensor q_scale,
-        Tensor k_int8, Tensor k_scale,
-        Tensor v_int8, Tensor v_scale,
-        Tensor o_int8, Tensor o_scale,
+        Tensor q_int8, Tensor q_scale, Tensor k_int8, Tensor k_scale,
+        Tensor v_int8, Tensor v_scale, Tensor o_int8, Tensor o_scale,
         // FFN1: fc1, fc2
-        Tensor ffn1_fc1_int8, Tensor ffn1_fc1_scale,
-        Tensor ffn1_fc2_int8, Tensor ffn1_fc2_scale,
+        Tensor ffn1_fc1_int8, Tensor ffn1_fc1_scale, Tensor ffn1_fc2_int8,
+        Tensor ffn1_fc2_scale,
         // FFN2: fc1, fc2
-        Tensor ffn2_fc1_int8, Tensor ffn2_fc1_scale,
-        Tensor ffn2_fc2_int8, Tensor ffn2_fc2_scale);
+        Tensor ffn2_fc1_int8, Tensor ffn2_fc1_scale, Tensor ffn2_fc2_int8,
+        Tensor ffn2_fc2_scale);
 
     void clear_position_projection_cache();
 
@@ -279,8 +286,7 @@ class FastConformerEncoder : public Module {
     // tensor on every subsequent call with the same key. Called once per
     // forward() pass; exposed publicly so callers (and tests) can warm the
     // cache for known bucket shapes ahead of time.
-    Tensor pos_emb(int seq_len, int d_model, DType dtype,
-                   Device device) const;
+    Tensor pos_emb(int seq_len, int d_model, DType dtype, Device device) const;
 
     // Number of distinct (seq_len, d_model, dtype, device) tuples currently
     // memoised. Exposed for diagnostics + WAS-28 regression tests;
@@ -330,8 +336,7 @@ class FastConformerEncoder : public Module {
     // post-warmup); other consumers without bucketing could grow this
     // arbitrarily. At d_model=1024, fp16, seq_len=3000 one entry is
     // ~12 MB. If a non-bucketed consumer materialises, switch to LRU.
-    mutable std::unordered_map<PosEmbKey, Tensor, PosEmbKeyHash>
-        pos_emb_cache_;
+    mutable std::unordered_map<PosEmbKey, Tensor, PosEmbKeyHash> pos_emb_cache_;
 
     // Scans state_dict for _quantized keys and injects int8 weight pairs
     // into each ConformerBlock's sub-modules.
