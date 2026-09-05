@@ -22,10 +22,31 @@ option(PARAKEET_BUILD_BENCHMARKS "Build parakeet benchmarks" OFF)
 option(PARAKEET_BUILD_EXAMPLES "Build parakeet examples" ON)
 option(PARAKEET_BUILD_SERVER_EXAMPLE "Build the Unix socket server example" OFF)
 option(BUILD_SHARED_LIBS "Build shared library instead of static" OFF)
+option(PARAKEET_INSTALL "Generate install rules for parakeet" OFF)
 
 # ── Axiom ────────────────────────────────────────────────────────────────────
 set(AXIOM_BUILD_TESTS OFF)
 set(AXIOM_BUILD_EXAMPLES OFF)
+
+if(PARAKEET_INSTALL)
+    # A Parakeet package exports a public dependency on Axiom::axiom. Do not
+    # silently override an explicit request to omit Axiom's export; that would
+    # create an install tree that configures but cannot be consumed.
+    if(DEFINED AXIOM_INSTALL AND NOT AXIOM_INSTALL)
+        message(FATAL_ERROR
+            "PARAKEET_INSTALL=ON requires AXIOM_INSTALL=ON because the "
+            "installed Parakeet target depends on Axiom::axiom. Remove "
+            "-DAXIOM_INSTALL=OFF or set it to ON.")
+    endif()
+    if(NOT DEFINED AXIOM_INSTALL)
+        # This is a per-configuration default, not ownership of a cache
+        # setting. A later parent or -DAXIOM_INSTALL value remains authoritative.
+        set(AXIOM_INSTALL ON)
+    endif()
+elseif(NOT DEFINED AXIOM_INSTALL)
+    # Bundled consumers do not need an Axiom install tree unless they opt in.
+    set(AXIOM_INSTALL OFF)
+endif()
 if(PARAKEET_BUILD_BENCHMARKS)
     set(AXIOM_BUILD_BENCHMARKS ON)
 else()
@@ -97,8 +118,6 @@ endif()
 # parakeet into a single-archive distribution can disable install rules
 # (otherwise install(EXPORT ...) requires axiom + ggml etc. to be in
 # export sets, which they aren't when bundled).
-option(PARAKEET_INSTALL "Generate install rules for parakeet" ON)
-
 if(PARAKEET_INSTALL)
 install(TARGETS parakeet_lib
     EXPORT ParakeetTargets
@@ -161,6 +180,9 @@ if(PARAKEET_BUILD_TESTS)
         GIT_TAG v1.14.0
     )
     set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    # Test-only dependencies must not leak into a Parakeet install tree.
+    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+    set(INSTALL_GMOCK OFF CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(googletest)
 
     enable_testing()
@@ -192,6 +214,37 @@ if(PARAKEET_BUILD_TESTS)
     add_test(NAME test_linear_int8_mpsmm_parity COMMAND test_linear_int8_mpsmm_parity
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     )
+
+    # Safe Direct regressions. Hermetic Direct-QKV fallback coverage always
+    # runs on Metal; the optional production INT8 fixture adds model-level
+    # parity and position-cache checks when it is available.
+    set(PARAKEET_SAFE_DIRECT_MODEL_FIXTURE "" CACHE FILEPATH
+        "Path to the production INT8 FastConformer safetensors fixture")
+    add_executable(test_safe_direct_encoder tests/test_safe_direct_encoder.cpp)
+    target_link_libraries(test_safe_direct_encoder PRIVATE parakeet_lib GTest::gtest GTest::gtest_main)
+    target_compile_definitions(test_safe_direct_encoder PRIVATE
+        PARAKEET_SAFE_DIRECT_MODEL_FIXTURE="${PARAKEET_SAFE_DIRECT_MODEL_FIXTURE}")
+    add_test(NAME test_safe_direct_encoder COMMAND test_safe_direct_encoder
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+
+    add_test(
+        NAME test_install_options
+        COMMAND "${CMAKE_COMMAND}"
+            -DPARAKEET_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_install_options.cmake"
+    )
+
+    if(PARAKEET_INSTALL)
+        add_test(
+            NAME test_install_consumer
+            COMMAND "${CMAKE_COMMAND}"
+                "-DPARAKEET_BINARY_DIR=${CMAKE_BINARY_DIR}"
+                "-DPARAKEET_CONSUMER_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/tests/install_consumer"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_install_consumer.cmake"
+        )
+        set_tests_properties(test_install_consumer PROPERTIES TIMEOUT 180)
+    endif()
 endif()
 
 # ── Examples ─────────────────────────────────────────────────────────────────

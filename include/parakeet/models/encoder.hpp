@@ -5,6 +5,7 @@
 #include <map>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <axiom/axiom.hpp>
 #include <axiom/nn.hpp>
@@ -15,6 +16,33 @@ namespace parakeet::models {
 
 using namespace axiom;
 using namespace axiom::nn;
+
+// Diagnostic snapshot of the routes taken by the last completed encoder
+// forward. These observations never participate in route selection.
+struct EncoderRouteStats {
+    bool direct_qkv_head_layout_used = false;
+    bool direct_silu_used = false;
+    bool cached_position_head_layout_used = false;
+    bool cached_position_head_layout_cache_hit = false;
+};
+
+namespace detail {
+
+// Returns true only when every projected Q/K/V input is the same logical
+// tensor view. The fused Direct-QKV kernel reads one activation tensor, so a
+// shared allocation alone is not sufficient.
+bool shares_direct_qkv_input(const Tensor &query, const Tensor &key,
+                             const Tensor &value);
+
+// Selects the fused Direct-QKV route without materializing an ineligible lazy
+// input. The Axiom capability check is deliberately first: storage identity is
+// only needed after the route is known to be otherwise valid.
+bool can_use_direct_qkv_head_layout(const Tensor &query, const Tensor &key,
+                                    const Tensor &value,
+                                    const ops::Int8QkvProjections &projections,
+                                    size_t num_heads);
+
+} // namespace detail
 
 // ─── Feed-Forward Module (Macaron-style half-step) ──────────────────────────
 
@@ -93,8 +121,9 @@ class ConformerAttention : public Module {
     }
 
     // Called by FastConformerEncoder::load_state_dict when int8 weights are
-    // detected. Delegates to mha_.q_proj/k_proj/v_proj/out_proj.load_int8_weights()
-    // so Linear::forward() dispatches automatically through the int8 fast path.
+    // detected. Delegates to
+    // mha_.q_proj/k_proj/v_proj/out_proj.load_int8_weights() so
+    // Linear::forward() dispatches automatically through the int8 fast path.
     void load_int8_weights(Tensor q_int8, Tensor q_scale, Tensor k_int8,
                            Tensor k_scale, Tensor v_int8, Tensor v_scale,
                            Tensor o_int8, Tensor o_scale);
@@ -116,6 +145,15 @@ class ConformerAttention : public Module {
     // resident on `d`. See FeedForward::all_int8_on() for full rationale.
     bool all_int8_on(Device d) const;
 
+    void clear_position_projection_cache();
+    // Position projections are derived from pos_proj_ weights. Clear their
+    // cache before the base loader replaces those weights.
+    void load_state_dict(const std::map<std::string, Tensor> &state_dict,
+                         const std::string &prefix = "",
+                         bool strict = true) override;
+    Module &to(Device device) override;
+    Module &to(DType dtype) override;
+
   private:
     LayerNorm norm_;
     MultiHeadAttention mha_;
@@ -128,7 +166,26 @@ class ConformerAttention : public Module {
     Tensor rel_position_attention(const Tensor &query, const Tensor &key,
                                   const Tensor &value, const Tensor &pos_emb,
                                   const Tensor &mask) const;
+    Tensor projected_position_head_layout(const Tensor &pos_emb,
+                                          size_t num_heads) const;
     static Tensor rel_shift(const Tensor &x);
+
+    struct PositionProjectionCacheEntry {
+        Tensor source;
+        Tensor head_layout;
+        size_t num_heads = 0;
+        size_t last_used = 0;
+    };
+
+    // Bounded input buckets rotate among a small number of persistent position
+    // embeddings. Keep their head-major projections so switching buckets does
+    // not recompute every attention-layer position projection. Source storage
+    // remains part of the key, so equal-shaped caller-provided embeddings are
+    // never conflated.
+    static constexpr size_t kPositionProjectionCacheCapacity = 9;
+    mutable std::vector<PositionProjectionCacheEntry>
+        position_projection_cache_;
+    mutable size_t position_projection_cache_clock_ = 0;
 };
 
 // ─── Conformer Block ────────────────────────────────────────────────────────
@@ -150,16 +207,16 @@ class ConformerBlock : public Module {
     // FeedForward::load_int8_weights.
     void load_int8_weights(
         // Attention: q, k, v, out_proj
-        Tensor q_int8, Tensor q_scale,
-        Tensor k_int8, Tensor k_scale,
-        Tensor v_int8, Tensor v_scale,
-        Tensor o_int8, Tensor o_scale,
+        Tensor q_int8, Tensor q_scale, Tensor k_int8, Tensor k_scale,
+        Tensor v_int8, Tensor v_scale, Tensor o_int8, Tensor o_scale,
         // FFN1: fc1, fc2
-        Tensor ffn1_fc1_int8, Tensor ffn1_fc1_scale,
-        Tensor ffn1_fc2_int8, Tensor ffn1_fc2_scale,
+        Tensor ffn1_fc1_int8, Tensor ffn1_fc1_scale, Tensor ffn1_fc2_int8,
+        Tensor ffn1_fc2_scale,
         // FFN2: fc1, fc2
-        Tensor ffn2_fc1_int8, Tensor ffn2_fc1_scale,
-        Tensor ffn2_fc2_int8, Tensor ffn2_fc2_scale);
+        Tensor ffn2_fc1_int8, Tensor ffn2_fc1_scale, Tensor ffn2_fc2_int8,
+        Tensor ffn2_fc2_scale);
+
+    void clear_position_projection_cache();
 
   private:
     FeedForward ffn1_;
@@ -234,13 +291,14 @@ class FastConformerEncoder : public Module {
     // tensor on every subsequent call with the same key. Called once per
     // forward() pass; exposed publicly so callers (and tests) can warm the
     // cache for known bucket shapes ahead of time.
-    Tensor pos_emb(int seq_len, int d_model, DType dtype,
-                   Device device) const;
+    Tensor pos_emb(int seq_len, int d_model, DType dtype, Device device) const;
 
     // Number of distinct (seq_len, d_model, dtype, device) tuples currently
     // memoised. Exposed for diagnostics + WAS-28 regression tests;
     // consumers do not depend on entry-level details.
     size_t pos_emb_cache_size() const { return pos_emb_cache_.size(); }
+
+    EncoderRouteStats route_stats() const { return last_route_stats_; }
 
   private:
     EncoderConfig config_;
@@ -248,6 +306,7 @@ class FastConformerEncoder : public Module {
     ModuleList layers_;
 
     bool is_int8_ = false;
+    mutable EncoderRouteStats last_route_stats_;
 
     // Cache key for memoised sinusoidal_position_embedding results.
     // (d_model, dtype, device) are effectively constant once the encoder is
@@ -282,8 +341,7 @@ class FastConformerEncoder : public Module {
     // post-warmup); other consumers without bucketing could grow this
     // arbitrarily. At d_model=1024, fp16, seq_len=3000 one entry is
     // ~12 MB. If a non-bucketed consumer materialises, switch to LRU.
-    mutable std::unordered_map<PosEmbKey, Tensor, PosEmbKeyHash>
-        pos_emb_cache_;
+    mutable std::unordered_map<PosEmbKey, Tensor, PosEmbKeyHash> pos_emb_cache_;
 
     // Scans state_dict for _quantized keys and injects int8 weight pairs
     // into each ConformerBlock's sub-modules.
