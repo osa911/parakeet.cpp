@@ -146,6 +146,11 @@ class ConformerAttention : public Module {
     bool all_int8_on(Device d) const;
 
     void clear_position_projection_cache();
+    // Position projections are derived from pos_proj_ weights. Clear their
+    // cache before the base loader replaces those weights.
+    void load_state_dict(const std::map<std::string, Tensor> &state_dict,
+                         const std::string &prefix = "",
+                         bool strict = true) override;
     Module &to(Device device) override;
     Module &to(DType dtype) override;
 

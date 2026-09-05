@@ -366,6 +366,30 @@ TEST(SafeDirectEncoder, ProductionInt8DirectAndGenericAttentionMatch) {
     EXPECT_LE(max_abs_delta(direct, generic), 5e-4f);
 }
 
+TEST(SafeDirectEncoder, AttentionReloadClearsCachedPositionProjection) {
+    using parakeet::models::ConformerAttention;
+
+    ConformerAttention attention(/*num_heads=*/2, /*dropout=*/0.0f);
+    const Tensor position = Tensor::ones({3, 4}, DType::Float32);
+    std::map<std::string, Tensor> state;
+    state["pos_proj_.weight"] = Tensor::ones({4, 4}, DType::Float32);
+    attention.load_state_dict(state, "", /*strict=*/false);
+
+    const Tensor first = attention.projected_position_head_layout(position, 2);
+    const Tensor cached = attention.projected_position_head_layout(position, 2);
+    ASSERT_EQ(attention.position_projection_cache_.size(), 1u);
+    EXPECT_FLOAT_EQ(first.item<float>({0, 0, 0, 0}), 4.0f);
+    EXPECT_FLOAT_EQ(cached.item<float>({0, 0, 0, 0}), 4.0f);
+
+    state["pos_proj_.weight"] = Tensor::zeros({4, 4}, DType::Float32);
+    attention.load_state_dict(state, "", /*strict=*/false);
+
+    EXPECT_TRUE(attention.position_projection_cache_.empty());
+    const Tensor reloaded =
+        attention.projected_position_head_layout(position, 2);
+    EXPECT_FLOAT_EQ(reloaded.item<float>({0, 0, 0, 0}), 0.0f);
+}
+
 TEST(SafeDirectEncoder, RetainsPositionHeadLayoutsAcrossActiveBuckets) {
     unset_encoder_experiments();
 

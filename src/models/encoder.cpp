@@ -251,6 +251,13 @@ void ConformerAttention::clear_position_projection_cache() {
     position_projection_cache_clock_ = 0;
 }
 
+void ConformerAttention::load_state_dict(
+    const std::map<std::string, Tensor> &state_dict, const std::string &prefix,
+    bool strict) {
+    clear_position_projection_cache();
+    Module::load_state_dict(state_dict, prefix, strict);
+}
+
 Module &ConformerAttention::to(Device device) {
     clear_position_projection_cache();
     return Module::to(device);
